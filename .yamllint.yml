@@ -1,0 +1,50 @@
+# YAML Lint configuration for agent project
+
+extends: default
+
+rules:
+  # Allow longer lines for readability
+  line-length:
+    max: 120
+    level: warning
+
+  # Allow indentation for readability in YAML
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  # Be more flexible with comments
+  comments:
+    min-spaces-from-content: 1
+
+  # Allow empty values for optional fields
+  empty-values:
+    forbid-in-block-mappings: false
+    forbid-in-flow-mappings: true
+
+  # Allow truthy values (on/off, yes/no)
+  truthy:
+    allowed-values: ["true", "false", "on", "off", "yes", "no"]
+
+  # Allow document start/end markers
+  document-start:
+    present: false
+
+  # Allow multiple documents in one file
+  document-end:
+    present: false
+
+  # Allow braces for Golang template syntax (Helm templates)
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+    min-spaces-inside-empty: 0
+    max-spaces-inside-empty: 0
+
+  # Don't enforce bracket spacing for template syntax
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+    min-spaces-inside-empty: 0
+    max-spaces-inside-empty: 0

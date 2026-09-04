@@ -1,0 +1,12 @@
+{{/*
+Tools - Deploy after models but before agents
+These resources provide custom tools that agents can use
+They should be deployed before agents so agents can reference them
+*/}}
+{{- if not .Values.excludeResources }}
+{{- range $path, $_ := .Files.Glob "tools/*.yaml" }}
+---
+{{ $content := $.Files.Get $path }}
+{{- $content | replace "metadata:" "metadata:\n  annotations:\n    \"helm.sh/hook\": pre-install,pre-upgrade\n    \"helm.sh/hook-weight\": \"-3\"\n    \"helm.sh/hook-delete-policy\": before-hook-creation" }}
+{{- end }}
+{{- end }}

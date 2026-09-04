@@ -1,0 +1,216 @@
+# Default values for repository-documentation
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Project configuration
+project:
+  name: repository-documentation
+  namespace: repository-documentation
+
+# Image configuration
+image:
+  registry: localhost:5000
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Model configurations
+# Models are deployed from the models/ directory
+# Edit files in models/ to configure your model providers
+
+# Agent configurations
+# Agents are deployed from the agents/ directory
+# Edit files in agents/ to configure your agents
+
+# Team configurations
+# Teams are deployed from the teams/ directory
+# Edit files in teams/ to configure your teams
+
+# Query configurations
+# Queries are deployed from the queries/ directory
+# Edit files in queries/ to configure your queries
+
+# Tools configuration
+# Tools are deployed from the tools/ directory as YAML files
+# Each .yaml file in tools/ is automatically deployed
+
+# Repository Collector - HTTP service backing the `repository-collector` ARK Tool.
+# NOTE: `name` and `port` must stay in sync with the URL hardcoded in
+# tools/repository-collector.yaml, which cannot interpolate Helm values.
+collector:
+  enabled: true
+  name: repository-collector
+  port: 8080
+  replicas: 1
+  image:
+    repository: localhost:5000/repository-documentation-repository-collector
+    tag: m4
+    # Docker Desktop Kubernetes caches :latest; bump this tag when the image changes.
+    pullPolicy: IfNotPresent
+  # Disk budget for transient clones (mounted at /tmp).
+  workspaceSizeLimit: 2Gi
+  # Restrict local-path collection to this directory. Empty means local paths are
+  # resolved anywhere inside the container (which only ever holds clones).
+  localRepoRoot: ""
+  resources:
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+
+# GitLab authentication for private (including self-hosted) repositories.
+# Leave tokenSecret.name empty so public GitHub collection keeps working.
+#
+# Create the secret yourself — never put a token in this file or in the Tool YAML:
+#   kubectl create secret generic gitlab-token \
+#     --from-literal=token=<GITLAB_PAT> \
+#     --namespace default
+# Then: --set gitlab.tokenSecret.name=gitlab-token
+gitlab:
+  tokenSecret:
+    name: ""
+    key: token
+
+# HTML renderer - HTTP service backing the `documentation-renderer` ARK Tool.
+# `name` and `port` must stay in sync with tools/documentation-renderer.yaml.
+renderer:
+  enabled: true
+  name: documentation-renderer
+  port: 8080
+  replicas: 1
+  image:
+    repository: localhost:5000/repository-documentation-documentation-renderer
+    tag: m5
+    pullPolicy: IfNotPresent
+  workspaceSizeLimit: 64Mi
+  output:
+    path: /mnt/output
+    sizeLimit: 256Mi
+    # Docker Desktop Kubernetes (kind node) cannot hostPath a Windows folder.
+    # hostDocker publishes the renderer on the Windows host with:
+    #   docker run -d --name documentation-renderer-host --restart=unless-stopped
+    #     -p 18080:8080 -e OUTPUT_DIR=/mnt/output
+    #     -v C:\Users\moham\source\repos\repository-documentation\out:/mnt/output
+    #     localhost:5000/repository-documentation-documentation-renderer:m5
+    # The in-cluster Service keeps the Tool URL unchanged.
+    hostDocker: true
+    windowsPath: C:\Users\moham\source\repos\repository-documentation\out
+    hostIP: 192.168.65.254
+    hostPort: 18080
+    # Used only when hostDocker is false.
+    hostPath: ""
+  resources:
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+
+# MCP Servers configuration
+# MCP servers are deployed from the mcp-servers/ directory
+# Use 'ark generate mcp-server <name>' to create new MCP servers
+
+# Memory configuration
+memory:
+  enabled: true
+  name: postgres-memory
+  type: postgres
+  url: "http://postgres-memory:8080"
+
+# Security
+security:
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    fsGroup: 2000
+
+  # Container security context
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 1001
+    capabilities:
+      drop:
+        - ALL
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: repository-documentation.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Resource defaults
+resources:
+  limits:
+    memory: "1Gi"
+    cpu: "1000m"
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+
+# Node selection
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Monitoring
+monitoring:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+
+# Logging
+logging:
+  level: INFO
+  format: json
+
+# Environment variables
+env: {}
+
+# Additional labels
+labels: {}
+
+# Additional annotations
+annotations: {}
+
+# Service Account configuration
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Custom secrets (will be created)
+secrets:
+  {}
+  # example-secret:
+  #   data:
+  #     key: value
+
+# Custom config maps
+configMaps:
+  {}
+  # example-config:
+  #   data:
+  #     config.yaml: |
+  #       key: value

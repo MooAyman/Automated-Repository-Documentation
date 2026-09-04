@@ -1,0 +1,14 @@
+# Secrets and local environment - never commit API keys or Git credentials
+.env
+.env.local
+*.pem
+*.key
+
+# Build output
+out/
+*.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

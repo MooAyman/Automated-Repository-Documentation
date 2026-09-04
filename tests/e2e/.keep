@@ -1,0 +1,10 @@
+# End-to-End Tests
+
+Add end-to-end tests for your workflows here.
+
+Example:
+```
+tests/e2e/
+├── test_agent_workflow.yaml
+└── test_team_collaboration.yaml
+```

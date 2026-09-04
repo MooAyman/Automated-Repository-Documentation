@@ -1,0 +1,31 @@
+# Wraps Agent/repository-documentation so another Agent can call it as a Tool.
+# ARK 0.1.68 looks up a Tool CR for every Agent.spec.tools[] entry; it does not
+# accept a bare Agent name. The child's outputSchema is returned as a JSON string.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-documentation
+  labels:
+    project: repository-documentation
+    component: tool
+    role: agent-tool
+spec:
+  type: agent
+  description: >-
+    Delegates to the repository-documentation agent. Pass the user's repository
+    URL and optional branch/tag/commit in `input`. Returns the agent's structured
+    documentation JSON. Do not call this to generate HTML.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    required:
+      - input
+    properties:
+      input:
+        type: string
+        description: >-
+          The documentation request forwarded to the documentation agent,
+          including the repository URL and an optional ref (branch, tag, or
+          commit). Example: "Document https://github.com/org/repo ref: develop"
+  agent:
+    name: repository-documentation

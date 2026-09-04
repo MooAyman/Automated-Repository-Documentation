@@ -1,0 +1,11 @@
+{{/*
+Teams - Deploy after agents are ready
+Teams depend on agents and should be created after agents but before queries
+*/}}
+{{- if not .Values.excludeResources }}
+{{- range $path, $_ := .Files.Glob "teams/*.yaml" }}
+---
+{{ $content := $.Files.Get $path }}
+{{- $content | replace "metadata:" "metadata:\n  annotations:\n    \"helm.sh/hook\": post-install,post-upgrade\n    \"helm.sh/hook-weight\": \"5\"" }}
+{{- end }}
+{{- end }}

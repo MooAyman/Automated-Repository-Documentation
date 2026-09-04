@@ -1,0 +1,14 @@
+# Documentation
+
+Add detailed documentation here as your project grows.
+
+The main README.md covers all essentials for getting started.
+
+Example structure:
+```
+docs/
+├── architecture.md      # System architecture
+├── deployment.md        # Advanced deployment guide  
+├── development.md       # Development workflows
+└── troubleshooting.md   # Detailed troubleshooting
+```

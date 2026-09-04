@@ -1,0 +1,34 @@
+# MCP Servers Directory
+
+Add your MCP servers here using the ark CLI generator.
+
+Each MCP server should be in its own subdirectory generated with:
+```bash
+ark generate mcp-server <server-name>
+```
+
+This will create a complete MCP server with:
+- Dockerfile with multi-technology support
+- Helm chart for Kubernetes deployment  
+- Build and deployment scripts
+- Example agent and query configurations
+
+Example structure:
+```
+mcp-servers/
+├── weather-api/
+│   ├── Dockerfile
+│   ├── Makefile
+│   ├── build.sh
+│   ├── chart/
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml
+│   │   └── templates/
+│   └── examples/
+└── github-tools/
+    ├── Dockerfile
+    ├── chart/
+    └── ...
+```
+
+The deployment system will automatically detect and deploy any MCP servers you add here.

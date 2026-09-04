@@ -1,0 +1,141 @@
+{{/*
+Documentation Renderer - HTTP service backing Tool/documentation-renderer.
+Service name is fixed so tools/documentation-renderer.yaml can use a stable FQDN.
+
+Docker Desktop Kubernetes (kind node desktop-control-plane) cannot hostPath a
+Windows directory. When renderer.output.hostDocker is true, the Service is
+backed by a host-published container whose /mnt/output is bind-mounted to
+renderer.output.windowsPath.
+*/}}
+{{- if .Values.renderer.enabled }}
+{{- if not .Values.renderer.output.hostDocker }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.renderer.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: renderer
+spec:
+  replicas: {{ .Values.renderer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 6 }}
+      component: renderer
+  template:
+    metadata:
+      labels:
+        {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 8 }}
+        component: renderer
+    spec:
+      serviceAccountName: {{ include "{{ .Values.project.name }}.serviceAccountName" . }}
+      {{- with .Values.security.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: renderer
+          image: "{{ .Values.renderer.image.repository }}:{{ .Values.renderer.image.tag }}"
+          imagePullPolicy: {{ .Values.renderer.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.renderer.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.renderer.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+            - name: OUTPUT_DIR
+              value: {{ .Values.renderer.output.path | quote }}
+          {{- with .Values.security.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /tmp
+            - name: output
+              mountPath: {{ .Values.renderer.output.path | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.renderer.resources | nindent 12 }}
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: {{ .Values.renderer.workspaceSizeLimit }}
+        - name: output
+          {{- if .Values.renderer.output.hostPath }}
+          hostPath:
+            path: {{ .Values.renderer.output.hostPath | quote }}
+            type: DirectoryOrCreate
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.renderer.output.sizeLimit }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.renderer.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: renderer
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.renderer.port }}
+      {{- if .Values.renderer.output.hostDocker }}
+      targetPort: {{ .Values.renderer.output.hostPort }}
+      {{- else }}
+      targetPort: http
+      {{- end }}
+      protocol: TCP
+  {{- if not .Values.renderer.output.hostDocker }}
+  selector:
+    {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 4 }}
+    component: renderer
+  {{- end }}
+{{- if .Values.renderer.output.hostDocker }}
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: {{ .Values.renderer.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: renderer
+subsets:
+  - addresses:
+      - ip: {{ .Values.renderer.output.hostIP | quote }}
+    ports:
+      - name: http
+        port: {{ .Values.renderer.output.hostPort }}
+        protocol: TCP
+{{- end }}
+{{- end }}

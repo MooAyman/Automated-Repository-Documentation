@@ -1,0 +1,123 @@
+{{/*
+Repository Collector - the HTTP service that backs the `repository-collector`
+ARK Tool defined in tools/repository-collector.yaml.
+
+Deployed as part of the main release (not as a Helm hook) so that `--wait` blocks
+until the service is ready before the post-install Query hook runs.
+
+The Service name is fixed rather than derived from the release name, because
+tools/repository-collector.yaml is copied verbatim by templates/03-tools.yaml and
+therefore cannot interpolate Helm values into its URL.
+*/}}
+{{- if .Values.collector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.collector.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: collector
+spec:
+  replicas: {{ .Values.collector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 6 }}
+      component: collector
+  template:
+    metadata:
+      labels:
+        {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 8 }}
+        component: collector
+    spec:
+      serviceAccountName: {{ include "{{ .Values.project.name }}.serviceAccountName" . }}
+      {{- with .Values.security.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collector
+          image: "{{ .Values.collector.image.repository }}:{{ .Values.collector.image.tag }}"
+          imagePullPolicy: {{ .Values.collector.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.collector.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.collector.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+            - name: CLONE_TIMEOUT_SECONDS
+              value: "300"
+            {{- with .Values.collector.localRepoRoot }}
+            - name: LOCAL_REPO_ROOT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- $gitlabSecret := "" }}
+            {{- if and .Values.gitlab .Values.gitlab.tokenSecret .Values.gitlab.tokenSecret.name }}
+            {{- $gitlabSecret = .Values.gitlab.tokenSecret.name }}
+            {{- end }}
+            {{- if $gitlabSecret }}
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $gitlabSecret }}
+                  key: {{ .Values.gitlab.tokenSecret.key | default "token" }}
+            {{- end }}
+          {{- with .Values.security.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Only writable location: holds HOME and the transient clones.
+            - name: workspace
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: {{ .Values.collector.workspaceSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.collector.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: collector
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.collector.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 4 }}
+    component: collector
+{{- end }}

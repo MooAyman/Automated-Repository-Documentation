@@ -1,0 +1,66 @@
+# ARK Tool: the repository collection capability exposed to agents.
+#
+# Backed by the `repository-collector` HTTP service defined in
+# templates/repository-collector.yaml (source in tools/repository-collector/).
+#
+# The URL is a fully qualified cluster DNS name because the ARK controller that
+# performs the call runs in the `ark-system` namespace, not in this one.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-collector
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Retrieves the complete, current source code of a Git repository. Accepts a
+    GitHub URL, a gitlab.com URL, a self-hosted GitLab URL, or a path to a
+    repository on the collector's local filesystem. Returns plain text containing
+    the repository name, its directory tree, a list of files that were
+    deliberately excluded, and the full contents of every source file preceded by
+    its relative path. Dependency, build and cache directories, binary files and
+    credential files are removed. Call this once per repository before writing
+    any documentation; its output is the only trustworthy description of the
+    repository's contents.
+  inputSchema:
+    type: object
+    properties:
+      repository:
+        type: string
+        description: >-
+          The repository to collect: an https Git URL (GitHub, gitlab.com, or
+          self-hosted GitLab, for example https://github.com/owner/name,
+          https://gitlab.com/group/name, or
+          https://gitlab.example.com/group/project.git), or an absolute local
+          filesystem path. Do not include credentials in the URL.
+      ref:
+        type: string
+        description: >-
+          Optional Git ref: a branch name, a tag name, or a commit SHA. Leave
+          empty to use the repository's default branch. Do not guess a branch
+          name. If the ref does not exist, collection fails; it will not fall
+          back to another ref.
+    required:
+      - repository
+  http:
+    url: http://repository-collector.default.svc.cluster.local:8080/collect
+    method: POST
+    timeout: 300s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {
+        "repository": "{{.input.repository}}",
+        "ref": "{{if .input.ref}}{{.input.ref}}{{end}}",
+        "max_file_bytes": {{.max_file_bytes}},
+        "max_total_bytes": {{.max_total_bytes}}
+      }
+    bodyParameters:
+      - name: max_file_bytes
+        value: "80000"
+      - name: max_total_bytes
+        value: "250000"

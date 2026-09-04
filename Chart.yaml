@@ -1,0 +1,19 @@
+apiVersion: v2
+name: repository-documentation
+description: A Helm chart for repository-documentation - Agents at Scale project
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/your-org/repository-documentation
+sources:
+  - https://github.com/your-org/repository-documentation
+maintainers:
+  - name: Your Team
+    email: your-team@example.com
+keywords:
+  - agents
+  - ai
+  - automation
+  - ark
+annotations:
+  category: AI/ML

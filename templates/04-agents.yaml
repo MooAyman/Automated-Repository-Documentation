@@ -1,0 +1,12 @@
+{{/*
+Agents - Deploy after models, MCP servers, and tools are ready
+These resources depend on models and can reference MCP servers and tools
+Agents must be ready before teams and queries can reference them
+*/}}
+{{- if not .Values.excludeResources }}
+{{- range $path, $_ := .Files.Glob "agents/*.yaml" }}
+---
+{{ $content := $.Files.Get $path }}
+{{- $content | replace "metadata:" "metadata:\n  annotations:\n    \"helm.sh/hook\": pre-install,pre-upgrade\n    \"helm.sh/hook-weight\": \"0\"\n    \"helm.sh/hook-delete-policy\": before-hook-creation" }}
+{{- end }}
+{{- end }}

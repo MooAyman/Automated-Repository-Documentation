@@ -1,0 +1,116 @@
+# ARK Tool: deterministic HTML renderer for Agent structured documentation JSON.
+#
+# Invoked as a second-stage Query (`target.type: tool`), not by the documentation
+# Agent. ARK 0.1.68 forces Agent.spec.outputSchema to be the final model response,
+# so the Agent cannot both emit that JSON and then call this tool in the same turn.
+#
+# Query input must be a JSON object matching inputSchema:
+#   {"documentation": { ... six-section document ... }}
+#
+# Nested object fields are expanded with printf %q because ARK HTTP body
+# templates do not JSON-encode maps.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: documentation-renderer
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Renders structured repository documentation JSON as a standalone HTML
+    document. Pass the Agent's output object in `documentation`. Does not call
+    a language model.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    properties:
+      documentationJson:
+        type: string
+        description: >-
+          The complete structured documentation JSON as a JSON string, exactly
+          as returned by the repository-documentation agent. Prefer this when
+          forwarding an agent-tool result. Do not summarise or rewrite it.
+      persist:
+        type: boolean
+        description: >-
+          If true, write the HTML file to the renderer output volume and return
+          JSON {filename, path, bytes} instead of the HTML document.
+      repositoryName:
+        type: string
+        description: >-
+          Optional repository name used as the HTML filename (for example
+          github-mcp-chatbot). Do not include a path.
+      documentation:
+        type: object
+        additionalProperties: false
+        required:
+          - repositoryOverview
+          - repositoryStructure
+          - toolsAndTechnologies
+          - coreConceptsAndArchitecture
+          - categorizedTechnicalInformation
+          - developerOnboardingGuide
+        properties:
+          repositoryOverview:
+            type: object
+            additionalProperties: false
+            required: [summary, quickStart]
+            properties:
+              summary: { type: string }
+              quickStart: { type: string }
+          repositoryStructure: { type: string }
+          toolsAndTechnologies: { type: string }
+          coreConceptsAndArchitecture:
+            type: object
+            additionalProperties: false
+            required: [summary, requestFlow, buildAndPackagingFlow]
+            properties:
+              summary: { type: string }
+              requestFlow: { type: string }
+              buildAndPackagingFlow: { type: string }
+          categorizedTechnicalInformation:
+            type: object
+            additionalProperties: false
+            required:
+              - mainApisAndEndpoints
+              - mainServicesAndMediators
+              - dtosSchemasMetadata
+              - securityComponents
+              - configurations
+              - entryPoints
+              - tests
+              - risksAndTechnicalDebt
+            properties:
+              mainApisAndEndpoints: { type: string }
+              mainServicesAndMediators: { type: string }
+              dtosSchemasMetadata: { type: string }
+              securityComponents: { type: string }
+              configurations: { type: string }
+              entryPoints: { type: string }
+              tests: { type: string }
+              risksAndTechnicalDebt: { type: string }
+          developerOnboardingGuide:
+            type: object
+            additionalProperties: false
+            required:
+              - first30Minutes
+              - howToInvestigateAProductionBug
+              - criticalFiles
+              - commonMistakes
+            properties:
+              first30Minutes: { type: string }
+              howToInvestigateAProductionBug: { type: string }
+              criticalFiles: { type: string }
+              commonMistakes: { type: string }
+  http:
+    url: http://documentation-renderer.default.svc.cluster.local:8080/render
+    method: POST
+    timeout: 60s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {{if .input.documentationJson}}{"documentation": {{.input.documentationJson}}, "persist": true, "repositoryName": {{if .input.repositoryName}}{{printf "%q" .input.repositoryName}}{{else}}""{{end}}}{{else}}{"documentation":{"repositoryOverview":{"summary":{{printf "%q" .input.documentation.repositoryOverview.summary}},"quickStart":{{printf "%q" .input.documentation.repositoryOverview.quickStart}}},"repositoryStructure":{{printf "%q" .input.documentation.repositoryStructure}},"toolsAndTechnologies":{{printf "%q" .input.documentation.toolsAndTechnologies}},"coreConceptsAndArchitecture":{"summary":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.summary}},"requestFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.requestFlow}},"buildAndPackagingFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.buildAndPackagingFlow}}},"categorizedTechnicalInformation":{"mainApisAndEndpoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainApisAndEndpoints}},"mainServicesAndMediators":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainServicesAndMediators}},"dtosSchemasMetadata":{{printf "%q" .input.documentation.categorizedTechnicalInformation.dtosSchemasMetadata}},"securityComponents":{{printf "%q" .input.documentation.categorizedTechnicalInformation.securityComponents}},"configurations":{{printf "%q" .input.documentation.categorizedTechnicalInformation.configurations}},"entryPoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.entryPoints}},"tests":{{printf "%q" .input.documentation.categorizedTechnicalInformation.tests}},"risksAndTechnicalDebt":{{printf "%q" .input.documentation.categorizedTechnicalInformation.risksAndTechnicalDebt}}},"developerOnboardingGuide":{"first30Minutes":{{printf "%q" .input.documentation.developerOnboardingGuide.first30Minutes}},"howToInvestigateAProductionBug":{{printf "%q" .input.documentation.developerOnboardingGuide.howToInvestigateAProductionBug}},"criticalFiles":{{printf "%q" .input.documentation.developerOnboardingGuide.criticalFiles}},"commonMistakes":{{printf "%q" .input.documentation.developerOnboardingGuide.commonMistakes}}}}}{{end}}

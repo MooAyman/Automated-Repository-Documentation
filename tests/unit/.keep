@@ -1,0 +1,10 @@
+# Unit Tests
+
+Add unit tests for your custom tools here.
+
+Example:
+```
+tests/unit/
+├── test_my_tool.py
+└── test_agent_logic.py
+```
