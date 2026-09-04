@@ -15,15 +15,15 @@ metadata:
 spec:
   type: http
   description: >-
-    Retrieves the complete, current source code of a Git repository. Accepts a
-    GitHub URL, a gitlab.com URL, a self-hosted GitLab URL, or a path to a
-    repository on the collector's local filesystem. Returns plain text containing
-    the repository name, its directory tree, a list of files that were
-    deliberately excluded, and the full contents of every source file preceded by
-    its relative path. Dependency, build and cache directories, binary files and
-    credential files are removed. Call this once per repository before writing
-    any documentation; its output is the only trustworthy description of the
-    repository's contents.
+    Collects a Git repository (GitHub, gitlab.com, or self-hosted GitLab HTTPS
+    URL) into a filtered plain-text dump: repository name, directory tree,
+    excluded-file reasons, and included file contents with relative paths.
+    Secrets, binaries, caches, lockfiles, and oversize files are omitted.
+    Included content is capped by per-file and total-content byte limits.
+    An absolute path inside the collector container is accepted as an internal
+    collector capability; it is not normal pipeline input. Call this once per
+    repository before writing any documentation; the dump is the only
+    trustworthy description of the collected contents.
   inputSchema:
     type: object
     properties:
@@ -33,8 +33,9 @@ spec:
           The repository to collect: an https Git URL (GitHub, gitlab.com, or
           self-hosted GitLab, for example https://github.com/owner/name,
           https://gitlab.com/group/name, or
-          https://gitlab.example.com/group/project.git), or an absolute local
-          filesystem path. Do not include credentials in the URL.
+          https://gitlab.example.com/group/project.git). Do not include
+          credentials in the URL. An absolute path is only valid inside the
+          collector container; do not pass a workstation path as pipeline input.
       ref:
         type: string
         description: >-

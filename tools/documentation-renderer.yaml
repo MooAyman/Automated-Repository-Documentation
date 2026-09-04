@@ -1,14 +1,14 @@
 # ARK Tool: deterministic HTML renderer for Agent structured documentation JSON.
 #
-# Called by Agent/repository-pipeline (and still usable as `ark query tool/...`).
-# The documentation Agent cannot call this tool in the same turn: ARK 0.1.68
-# treats Agent.spec.outputSchema as that Agent's final response.
+# Called by Agent/repository-pipeline. The documentation Agent cannot call this
+# tool in the same turn: ARK 0.1.68 treats Agent.spec.outputSchema as that
+# Agent's final response.
 #
-# Query input must be a JSON object matching inputSchema:
-#   {"documentation": { ... six-section document ... }}
-#
-# Nested object fields are expanded with printf %q because ARK HTTP body
-# templates do not JSON-encode maps.
+# Pipeline contract: pass documentationJson (the Agent JSON string). The HTTP
+# body wraps it as the documentation object and always persists the HTML file.
+# If documentationJson is omitted, the nested documentation object is a
+# template fallback (printf-expanded maps; ARK HTTP bodies do not JSON-encode
+# maps).
 apiVersion: ark.mckinsey.com/v1alpha1
 kind: Tool
 metadata:
@@ -20,8 +20,9 @@ spec:
   type: http
   description: >-
     Renders structured repository documentation JSON as a standalone HTML
-    document. Pass the Agent's output object in `documentation`. Does not call
-    a language model.
+    document. The pipeline passes documentationJson from the documentation
+    Agent; that JSON is sent as the documentation object. Does not call a
+    language model.
   inputSchema:
     type: object
     additionalProperties: false
@@ -30,13 +31,14 @@ spec:
         type: string
         description: >-
           The complete structured documentation JSON as a JSON string, exactly
-          as returned by the repository-documentation agent. Prefer this when
-          forwarding an agent-tool result. Do not summarise or rewrite it.
+          as returned by the repository-documentation agent. This is the
+          pipeline contract. Do not summarise or rewrite it.
       persist:
         type: boolean
         description: >-
-          If true, write the HTML file to the renderer output volume and return
-          JSON {filename, path, bytes} instead of the HTML document.
+          Unused by the pipeline HTTP body. The documentationJson path always
+          writes the HTML artifact and returns JSON {filename, path, bytes}
+          (the body template sets persist true).
       repositoryName:
         type: string
         description: >-
@@ -44,6 +46,10 @@ spec:
           github-mcp-chatbot). Do not include a path.
       documentation:
         type: object
+        description: >-
+          Fallback six-section document when documentationJson is omitted.
+          Same shape as the documentation Agent outputSchema. Not used by
+          the pipeline.
         additionalProperties: false
         required:
           - repositoryOverview

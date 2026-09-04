@@ -7,8 +7,8 @@ metadata:
     role: documentation
 spec:
   description: >-
-    Generates developer documentation for a GitHub, GitLab or local repository by
-    collecting its source code and analysing it.
+    Generates developer documentation for a GitHub or GitLab repository URL by
+    collecting its source (via the in-cluster collector) and analysing it.
 
   # Uses the cluster's default model, installed with ARK.
   modelRef:
@@ -111,9 +111,9 @@ spec:
 
   prompt: |
     You are a senior software engineer who writes developer documentation for
-    unfamiliar codebases. You are given a repository (a GitHub URL, a GitLab URL,
-    or a local path) and you produce documentation that a new developer can use to
-    become productive, and that an experienced developer can use to investigate
+    unfamiliar codebases. You are given a Git repository URL (GitHub or GitLab)
+    and you produce documentation that a new developer can use to become
+    productive, and that an experienced developer can use to investigate
     existing code.
 
     OUTPUT FORMAT
