@@ -308,11 +308,30 @@ python tests/test_collector.py
 
 Not implemented as user-facing features:
 
-- Local repository support (host-path / workstation repos as pipeline input)
+### Documentation Quality
+
+- Better Documentation Prompt
+- Evidence / Source References
+
+### Repository Coverage
+
+- Intelligent File Selection & Prioritization
 - Incremental documentation for repositories larger than the collector byte budget
-- LangFuse for observability.
-- Files Prioritization
-- UI
-- Private GitHub
-- LLM Analyzer
+- Local repository support (host-path / workstation repositories as pipeline input)
+- Private GitHub repository support
+
+### Architecture
+
+- Multi-stage Repository Analysis
+- LLM-based Repository Analyzer
+- Multi-Agent Documentation Team
+
+### Observability & Evaluation
+
+- LangFuse for observability
+- Automated Documentation Evals
+
+### User Experience
+
+- Web UI for browsing generated documentation
 
