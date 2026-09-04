@@ -1,8 +1,8 @@
 # ARK Tool: deterministic HTML renderer for Agent structured documentation JSON.
 #
-# Invoked as a second-stage Query (`target.type: tool`), not by the documentation
-# Agent. ARK 0.1.68 forces Agent.spec.outputSchema to be the final model response,
-# so the Agent cannot both emit that JSON and then call this tool in the same turn.
+# Called by Agent/repository-pipeline (and still usable as `ark query tool/...`).
+# The documentation Agent cannot call this tool in the same turn: ARK 0.1.68
+# treats Agent.spec.outputSchema as that Agent's final response.
 #
 # Query input must be a JSON object matching inputSchema:
 #   {"documentation": { ... six-section document ... }}

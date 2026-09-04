@@ -4,8 +4,8 @@ Offline checks of the collector:  python tests/test_collector.py
 Add the live clone test:          python tests/test_collector.py --network
 Add the deployed end-to-end test:  python tests/test_collector.py --e2e
 
-The --e2e mode reads the ARK Query that the chart deploys and asserts the agent
-returned a JSON object matching Agent.spec.outputSchema.
+The --e2e mode exercises the deployed repository-pipeline flow and verifies
+that documentation is generated successfully.
 """
 
 from __future__ import annotations
@@ -24,40 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "reposito
 import collector  # noqa: E402
 
 TARGET_REPO = "https://github.com/MooAyman/github-mcp-chatbot"
-QUERY_NAME = "document-github-mcp-chatbot"
-RENDER_QUERY_NAME = "render-github-mcp-chatbot"
 PIPELINE_QUERY_NAME = "pipeline-github-mcp-chatbot"
 COLLECTOR_LABEL = "component=collector"
 NAMESPACE = os.environ.get("ARK_NAMESPACE", "default")
 ROOT = Path(__file__).resolve().parents[1]
 HTML_OUTPUT = ROOT / "out" / "github-mcp-chatbot.html"
-
-ROOT_FIELDS = [
-    "repositoryOverview",
-    "repositoryStructure",
-    "toolsAndTechnologies",
-    "coreConceptsAndArchitecture",
-    "categorizedTechnicalInformation",
-    "developerOnboardingGuide",
-]
-OVERVIEW_FIELDS = ["summary", "quickStart"]
-ARCHITECTURE_FIELDS = ["summary", "requestFlow", "buildAndPackagingFlow"]
-CATEGORIZED_FIELDS = [
-    "mainApisAndEndpoints",
-    "mainServicesAndMediators",
-    "dtosSchemasMetadata",
-    "securityComponents",
-    "configurations",
-    "entryPoints",
-    "tests",
-    "risksAndTechnicalDebt",
-]
-ONBOARDING_FIELDS = [
-    "first30Minutes",
-    "howToInvestigateAProductionBug",
-    "criticalFiles",
-    "commonMistakes",
-]
 
 _failures: list[str] = []
 
@@ -421,27 +392,6 @@ def test_optional_gitlab_e2e() -> None:
         check(f"REF: {ref}" in dump, "resolved GitLab ref matches the request")
 
 
-def parse_json_content(content: str) -> object | None:
-    """Parse Query.status.response.content as JSON.
-
-    Structured output is a JSON string. Tolerate a leading/trailing Markdown
-    fence if the runtime wraps it, but do not fall back to heading parsing.
-    """
-    text = content.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        print(f"        json.loads failed: {exc}")
-        return None
-
-
 def _kubectl(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         args,
@@ -460,96 +410,6 @@ def collector_collect_count() -> int | None:
         print(f"        could not read collector logs: {(result.stderr or '').strip()}")
         return None
     return len(re.findall(r'POST /collect HTTP/\d\.\d" 200', result.stdout))
-
-
-def assert_object_fields(value: object, expected: list[str], label: str) -> None:
-    check(isinstance(value, dict), f"{label} is an object")
-    if not isinstance(value, dict):
-        return
-    actual = list(value.keys())
-    check(sorted(actual) == sorted(expected), f"{label} has exactly {expected}")
-    if sorted(actual) != sorted(expected):
-        print(f"        actual keys: {actual}")
-    for field in expected:
-        if field not in value:
-            continue
-        check(
-            isinstance(value[field], str) and bool(value[field].strip()),
-            f"{label}.{field} is a non-empty string",
-        )
-
-
-def test_deployed_documentation() -> None:
-    """Read the deployed ARK Query and check structured JSON documentation."""
-    print(f"\ndeployed query {QUERY_NAME} (namespace {NAMESPACE})")
-    obj = wait_for_query(QUERY_NAME, 600)
-    if obj is None:
-        check(False, f"kubectl could not read the query {QUERY_NAME}")
-        return
-
-    status = obj.get("status", {})
-    check(status.get("phase") == "done", f"query completed (phase={status.get('phase')})")
-    if status.get("phase") != "done":
-        print(f"        message: {status.get('message') or status.get('conditions')}")
-        return
-
-    content = (status.get("response") or {}).get("content", "")
-    check(bool(content), "query produced a response")
-    if not content:
-        return
-
-    parsed = parse_json_content(content)
-    check(parsed is not None, "response content parses with json.loads()")
-    if parsed is None:
-        print(f"        first 240 chars: {content[:240]!r}")
-        return
-
-    check(isinstance(parsed, dict), "root JSON is an object")
-    if not isinstance(parsed, dict):
-        return
-
-    actual_root = list(parsed.keys())
-    check(sorted(actual_root) == sorted(ROOT_FIELDS), "exactly the six expected top-level properties exist")
-    extra = [k for k in actual_root if k not in ROOT_FIELDS]
-    missing = [k for k in ROOT_FIELDS if k not in actual_root]
-    check(not extra, "no unexpected top-level properties exist")
-    if extra or missing:
-        print(f"        extra={extra} missing={missing}")
-
-    overview = parsed.get("repositoryOverview")
-    architecture = parsed.get("coreConceptsAndArchitecture")
-    categorized = parsed.get("categorizedTechnicalInformation")
-    onboarding = parsed.get("developerOnboardingGuide")
-    assert_object_fields(overview, OVERVIEW_FIELDS, "repositoryOverview")
-    check(isinstance(parsed.get("repositoryStructure"), str) and parsed["repositoryStructure"].strip(),
-          "repositoryStructure is a non-empty string")
-    check(isinstance(parsed.get("toolsAndTechnologies"), str) and parsed["toolsAndTechnologies"].strip(),
-          "toolsAndTechnologies is a non-empty string")
-    assert_object_fields(architecture, ARCHITECTURE_FIELDS, "coreConceptsAndArchitecture")
-    assert_object_fields(categorized, CATEGORIZED_FIELDS, "categorizedTechnicalInformation")
-    assert_object_fields(onboarding, ONBOARDING_FIELDS, "developerOnboardingGuide")
-
-    blob = json.dumps(parsed)
-    check("backend/agent/agent.py" in blob, "documentation cites backend/agent/agent.py")
-    check(re.search(r"POST\s+/chat", blob, re.I) is not None, "documentation mentions POST /chat")
-    check(re.search(r"GET\s+/health", blob, re.I) is not None, "documentation mentions GET /health")
-    check("ChatRequest" in blob, "documentation mentions ChatRequest")
-    check("ChatResponse" in blob, "documentation mentions ChatResponse")
-    check(re.search(r"OpenAI", blob, re.I) is not None, "documentation mentions OpenAI")
-    check(re.search(r"Gemini", blob, re.I) is not None, "documentation mentions Gemini")
-    check(re.search(r"GitHub MCP|github.?mcp|MCP", blob) is not None,
-          "documentation mentions GitHub MCP integration")
-
-    collect_ok = collector_collect_count()
-    if collect_ok is None:
-        check(False, "collector logs are readable")
-    else:
-        check(collect_ok >= 1, f"collector received at least one successful POST /collect (count={collect_ok})")
-
-    usage = status.get("tokenUsage", {})
-    print(f"  info  {len(content)} characters, {usage.get('promptTokens', '?')} prompt tokens, "
-          f"duration {status.get('duration', '?')}")
-    return parsed
 
 
 def wait_for_query(name: str, timeout_s: int) -> dict | None:
@@ -592,86 +452,6 @@ def apply_query(body: dict) -> bool:
             os.unlink(handle.name)
         except OSError:
             pass
-
-
-def test_deployed_html_renderer(parsed: dict) -> None:
-    """Second-stage ARK Query: Agent JSON → documentation-renderer Tool → HTML."""
-    print(f"\nsecond-stage query {RENDER_QUERY_NAME} (namespace {NAMESPACE})")
-    collects_before = collector_collect_count()
-
-    _kubectl(["kubectl", "delete", "query", RENDER_QUERY_NAME, "-n", NAMESPACE, "--ignore-not-found=true"])
-    time.sleep(1)
-
-    query = {
-        "apiVersion": "ark.mckinsey.com/v1alpha1",
-        "kind": "Query",
-        "metadata": {
-            "name": RENDER_QUERY_NAME,
-            "namespace": NAMESPACE,
-            "labels": {
-                "project": "repository-documentation",
-                "type": "e2e",
-                "target": "tool",
-            },
-        },
-        "spec": {
-            "input": json.dumps({"documentation": parsed}, ensure_ascii=False),
-            "target": {"type": "tool", "name": "documentation-renderer"},
-            "timeout": "2m",
-        },
-    }
-    if not apply_query(query):
-        check(False, "renderer Query was applied")
-        return
-
-    obj = wait_for_query(RENDER_QUERY_NAME, 180)
-    if obj is None:
-        check(False, "renderer Query completed")
-        return
-
-    status = obj.get("status") or {}
-    check(status.get("phase") == "done", f"renderer Query completed (phase={status.get('phase')})")
-    if status.get("phase") != "done":
-        return
-
-    html = (status.get("response") or {}).get("content") or ""
-    check(bool(html), "renderer Query produced a response")
-    if not html:
-        return
-
-    check(html.lstrip().startswith("<!DOCTYPE html>"), "response is a standalone HTML document")
-    check("<html" in html and "</html>" in html, "HTML root element is present")
-    for heading in [
-        "1. Repository Overview",
-        "2. Repository Structure",
-        "3. Tools &amp; Technologies Used",
-        "4. Core Concepts &amp; Architecture",
-        "5. Categorized Technical Information",
-        "6. Developer Onboarding Guide",
-    ]:
-        check(heading in html, f"rendered HTML contains {heading}")
-
-    check("backend/agent/agent.py" in html, "HTML cites backend/agent/agent.py")
-    check(re.search(r"POST\s+/chat", html, re.I) is not None, "HTML mentions POST /chat")
-    check(re.search(r"GET\s+/health", html, re.I) is not None, "HTML mentions GET /health")
-    check("ChatRequest" in html, "HTML mentions ChatRequest")
-    check("ChatResponse" in html, "HTML mentions ChatResponse")
-    check(re.search(r"OpenAI", html, re.I) is not None, "HTML mentions OpenAI")
-    check(re.search(r"Gemini", html, re.I) is not None, "HTML mentions Gemini")
-    check(re.search(r"GitHub MCP|github.?mcp|MCP", html) is not None, "HTML mentions GitHub MCP")
-
-    collects_after = collector_collect_count()
-    if collects_before is None or collects_after is None:
-        check(False, "collector logs are readable after the renderer Query")
-    else:
-        check(
-            collects_after == collects_before,
-            f"renderer Query did not call the collector (before={collects_before}, after={collects_after})",
-        )
-
-    HTML_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    HTML_OUTPUT.write_text(html, encoding="utf-8")
-    print(f"  info  wrote {len(html)} bytes to {HTML_OUTPUT}")
 
 
 def test_pipeline_config() -> None:
@@ -717,16 +497,8 @@ def renderer_artifact(filename: str) -> str | None:
     host = ROOT / "out" / filename
     if host.is_file():
         return host.read_text(encoding="utf-8")
-    result = _kubectl(
-        [
-            "kubectl", "exec", "-n", NAMESPACE, "deploy/documentation-renderer",
-            "--", "cat", f"/mnt/output/{filename}",
-        ]
-    )
-    if result.returncode != 0 or not result.stdout:
-        print(f"        could not read artifact: {(result.stderr or '').strip()}")
-        return None
-    return result.stdout
+    print(f"        could not read artifact: {host} is missing")
+    return None
 
 
 def test_pipeline_e2e() -> None:
@@ -833,12 +605,7 @@ def main() -> int:
         print("\nskipping live clone test (pass --network to enable)")
     test_optional_gitlab_e2e()
     if "--e2e" in sys.argv:
-        parsed = test_deployed_documentation()
-        if isinstance(parsed, dict):
-            test_deployed_html_renderer(parsed)
-            test_pipeline_e2e()
-        else:
-            print("skipping renderer Query (agent JSON was not available)")
+        test_pipeline_e2e()
     else:
         print("skipping deployed end-to-end test (pass --e2e to enable)")
 

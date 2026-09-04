@@ -64,28 +64,3 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
-
-{{/*
-Generate image name
-*/}}
-{{- define "{{ .Values.project.name }}.image" -}}
-{{- $registry := .Values.image.registry -}}
-{{- $repository := .repository -}}
-{{- $tag := .Values.image.tag -}}
-{{- printf "%s/%s-%s:%s" $registry .Values.project.name $repository $tag }}
-{{- end }}
-
-{{/*
-Generate model reference
-*/}}
-{{- define "{{ .Values.project.name }}.modelRef" -}}
-{{- if .Values.models.azure.enabled }}
-{{- .Values.models.azure.name }}
-{{- else if .Values.models.openai.enabled }}
-{{- .Values.models.openai.name }}
-{{- else if .Values.models.anthropic.enabled }}
-{{- .Values.models.anthropic.name }}
-{{- else }}
-default
-{{- end }}
-{{- end }}

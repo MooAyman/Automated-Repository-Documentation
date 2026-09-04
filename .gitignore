@@ -1,14 +1,31 @@
-# Secrets and local environment - never commit API keys or Git credentials
+# Secrets and local environment — never commit API keys or Git credentials
 .env
-.env.local
+.env.*
+!.env.example
+values.local.yaml
 *.pem
 *.key
+*.p12
+*.pfx
 
-# Build output
+# Generated HTML and Helm packages
 out/
 *.tgz
 
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 .venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

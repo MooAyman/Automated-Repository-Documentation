@@ -1,7 +1,5 @@
 {{/*
-Agents - Deploy after models, MCP servers, and tools are ready
-These resources depend on models and can reference MCP servers and tools
-Agents must be ready before teams and queries can reference them
+Agents - Deploy after tools so they can reference Tool CRs.
 */}}
 {{- if not .Values.excludeResources }}
 {{- range $path, $_ := .Files.Glob "agents/*.yaml" }}

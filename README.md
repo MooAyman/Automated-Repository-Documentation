@@ -1,211 +1,318 @@
 # Repository Documentation
 
-An ARK application that turns a Git repository into developer documentation.
+An ARK (Agentic Runtime for Kubernetes) application that turns a GitHub or GitLab repository into grounded developer documentation and a standalone HTML file.
 
-```
-repository URL
-      │
-      ▼
-Agent  repository-documentation          (ark.mckinsey.com/v1alpha1, kind: Agent)
-      │  calls
-      ▼
-Tool   repository-collector              (kind: Tool, type: http)
-      │  POST /collect
-      ▼
-Service repository-collector             (Deployment + Service, in cluster)
-      │  clones, filters, serialises
-      ▼
-repository content (plain text)
-      │
-      ▼
-LLM  (modelRef: default)
-      │
-      ▼
-developer documentation (Markdown, six sections)
-```
+Most repositories still depend on a README that drifts from the code. This project collects the current source, asks a model to fill a strict JSON schema from that dump only, and renders the result to HTML. You give it a URL; you do not copy intermediate JSON.
 
-Everything is a Kubernetes resource. The only application code is the collector
-service, which exists solely because an ARK `Tool` of `type: http` needs an
-endpoint to call.
+## Architecture
 
-## Layout
-
-```
-repository-documentation/
-├── agents/repository-documentation.yaml     # ARK Agent + documentation prompt
-├── tools/
-│   ├── repository-collector.yaml            # ARK Tool (type: http)
-│   └── repository-collector/                # the service the Tool calls
-│       ├── collector.py                     #   repository acquisition + filtering
-│       ├── server.py                        #   two-endpoint HTTP wrapper
-│       └── Dockerfile
-├── queries/document-github-mcp-chatbot.yaml # ARK Query (end-to-end test)
-├── templates/repository-collector.yaml      # Deployment + Service for the collector
-├── templates/00-rbac.yaml … 06-queries.yaml # generated: publish agents/tools/queries
-├── tests/test_collector.py                  # collector unit tests + deployed e2e check
-├── values.yaml
-└── Chart.yaml
+```text
+User
+  ↓  one ARK Query
+Agent/repository-pipeline          orchestrator (no analysis, no HTML)
+  ↓  Agent-as-Tool
+Agent/repository-documentation     analysis + spec.outputSchema JSON
+  ↓  HTTP Tool
+Tool/repository-collector          clone, filter, deterministic text dump
+  ↓
+Structured JSON
+  ↓  HTTP Tool
+Tool/documentation-renderer        deterministic HTML (no LLM)
+  ↓  /mnt/output/<repo>.html
+Windows host
+  C:\Users\moham\source\repos\repository-documentation\out\<repo>.html
 ```
 
-`templates/0*.yaml` come from `ark generate project` and publish every YAML file
-in `agents/`, `tools/` and `queries/` as Helm hooks in dependency order.
+
+| Resource                   | Kind          | Responsibility                                                                                                                            |
+| -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `repository-pipeline`      | Agent         | Extract URL and optional `ref`, call the documentation Agent once, pass the JSON unchanged to the renderer, return the artifact filename. |
+| `repository-documentation` | Agent         | Call the collector once, analyse the dump, fill `spec.outputSchema`.                                                                      |
+| `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump.                                                          |
+| `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
+| ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, the collector Deployment/Service, and the renderer Service (host-backed when `hostDocker` is true).       |
+
+
+Collector and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The documentation Agent owns analysis; the pipeline Agent only sequences the two stages. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
+
+## Features
+
+- One-command ARK pipeline (`ark query agent/repository-pipeline …`)
+- Public GitHub repositories
+- Public GitLab (`gitlab.com` and self-hosted) repositories
+- Private / self-hosted GitLab via a cluster Secret (`GITLAB_TOKEN`); the token is not sent with each query
+- Optional `ref` (branch, tag, or commit); omitted `ref` uses the default branch
+- Missing `ref` fails; the collector does not fall back
+- Strict structured JSON (`Agent.spec.outputSchema`)
+- Deterministic HTML rendering (no LLM)
+- HTML written to the Windows host `out/` directory
+- Query and tool-call visibility in the ARK Dashboard
+
+
 
 ## Prerequisites
 
-- A cluster with ARK installed and a `Model` named `default` in the target
-  namespace. `ark status` should report the controller ready and a default model.
-- Docker, `kubectl` and `helm`.
+Verified on this machine:
 
-This chart deliberately ships no `Model`; it reuses the one the ARK install
-already provides, so no API keys live in this repository.
+- Docker Desktop Kubernetes
+- ARK **0.1.68** (`ark --version`), with `Model/default` Available
+- `kubectl`, `helm`, `ark`, Docker, Python 3
+- Namespace `default` (Tool URLs are hardcoded to `*.default.svc.cluster.local`)
 
-## Deploy
+This chart does not ship a Model or API keys. It reuses the Model installed with ARK.
 
-```bash
-# 1. Build the collector image into the cluster's image store
-cd tools/repository-collector
-docker build -t localhost:5000/repository-documentation-repository-collector:latest .
+## Installation
 
-# 2. Install the chart
-cd ../..
+```powershell
+git clone https://github.com/MooAyman/Automated-Repository-Documentation.git
+cd Automated-Repository-Documentation
+
+kubectl cluster-info
+ark --version
+kubectl get model default
+```
+
+Build images (Docker Desktop uses the local image store; no `docker push` is required). Tags match `values.yaml`:
+
+```powershell
+docker build -t localhost:5000/repository-documentation-repository-collector:m4 tools/repository-collector
+docker build -t localhost:5000/repository-documentation-documentation-renderer:m5 tools/documentation-renderer
+```
+
+Publish the renderer on the Windows host so `/mnt/output` is the repo `out/` directory (Docker Desktop Kubernetes cannot `hostPath` a Windows folder):
+
+```powershell
+New-Item -ItemType Directory -Force -Path .\out | Out-Null
+
+docker run -d --name documentation-renderer-host --restart=unless-stopped `
+  -p 18080:8080 -e OUTPUT_DIR=/mnt/output `
+  -v C:\Users\moham\source\repos\repository-documentation\out:/mnt/output `
+  localhost:5000/repository-documentation-documentation-renderer:m5
+```
+
+The bind mount must be this checkout's `out/` directory and must match `values.yaml` `renderer.output.windowsPath`.
+
+Install the chart:
+
+```powershell
 helm upgrade --install repository-documentation . --namespace default --wait --timeout 6m
 ```
 
-On Docker Desktop the locally built image is visible to the kubelet, so
-`imagePullPolicy: IfNotPresent` resolves it without a registry. On kind or
-minikube, load the image first (`kind load docker-image …` / `minikube image
-load …`).
-
 Verify:
 
-```bash
-kubectl get agents
-kubectl get tools
-kubectl get pods -l component=collector
+```powershell
+kubectl get agent repository-pipeline repository-documentation
+kubectl get tool repository-documentation repository-collector documentation-renderer
 ```
 
-## Run
+Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
 
-The chart installs an ARK `Query` that runs the flow once on install. To run it
-again:
+With `renderer.output.hostDocker: true` (this chart's default), there is no in-cluster renderer Deployment. Confirm the host container instead:
 
-```bash
-kubectl delete query document-github-mcp-chatbot
-kubectl apply -f queries/document-github-mcp-chatbot.yaml
-kubectl get query document-github-mcp-chatbot -o jsonpath='{.status.response.content}'
+```powershell
+docker ps --filter name=documentation-renderer-host
+kubectl get svc,endpoints documentation-renderer
 ```
 
-Or ad hoc, against any repository:
 
-```bash
-ark query agent/repository-documentation \
-  "Generate developer documentation for https://github.com/MooAyman/github-mcp-chatbot"
-```
 
-## Test
+## GitLab private repositories
 
-```bash
-python tests/test_collector.py            # collector filtering, determinism, errors
-python tests/test_collector.py --network  # also clones the target repository
-python tests/test_collector.py --e2e      # also checks the deployed query's output
-```
+Public GitHub and public GitLab URLs work with no extra configuration.
 
-## How the pieces connect
+Private GitLab (including self-hosted) uses a Kubernetes Secret. Create it once; do not put the token in queries, Tool input, `values.yaml`, or Git.
 
-**The Agent reaches the collector through the ARK Tool**, declared as an explicit
-tool type on the agent:
-
-```yaml
-tools:
-  - type: http
-    name: repository-collector
-```
-
-**The Tool reaches the service over HTTP.** The ARK controller performs the call
-from the `ark-system` namespace, so `spec.http.url` must be a fully qualified
-cluster DNS name:
-
-```
-http://repository-collector.default.svc.cluster.local:8080/collect
-```
-
-The LLM's arguments are interpolated into the request body with ARK's Go template
-syntax (`{{.input.repository}}`); size limits come from `bodyParameters`. If you
-deploy to a different namespace, update that URL — `tools/*.yaml` is copied
-verbatim by the chart and cannot interpolate Helm values.
-
-## The collector
-
-`collector.py` is independent of ARK and of the LLM. Given a GitHub URL, a GitLab
-URL or a local path it produces one deterministic text document containing the
-repository name, its directory tree, the list of excluded files, and the contents
-of every included file preceded by its relative path.
-
-It excludes `.git`, dependency/build/cache directories, binaries (by extension and
-by NUL-byte sniff), generated lock files, and credential files such as `.env` and
-private keys — while allowing `.env.example`. Files above `max_file_bytes` are
-skipped, output is capped at `max_total_bytes`, line endings are normalised to LF,
-and paths are sorted lexicographically so the same repository state always yields
-byte-identical output.
-
-Every exclusion is reported in the output, so the agent can tell the reader what
-it was not shown.
-
-### Private GitLab repositories
-
-Authentication is infrastructure configuration, not Tool input. Create a
-Kubernetes Secret holding a GitLab personal access token, then point the chart
-at it:
-
-```bash
-kubectl create secret generic gitlab-token \
-  --from-literal=token=<GITLAB_PAT> \
+```powershell
+kubectl create secret generic gitlab-token `
+  --from-literal=token=<YOUR_GITLAB_PAT> `
   --namespace default
 
-helm upgrade --install repository-documentation . --namespace default \
-  --set gitlab.tokenSecret.name=gitlab-token
+helm upgrade --install repository-documentation . --namespace default `
+  --set gitlab.tokenSecret.name=gitlab-token `
+  --wait --timeout 6m
 ```
 
-The collector reads `GITLAB_TOKEN` from that Secret and authenticates to GitLab
-with a host-scoped HTTP `Authorization` header. The token is never placed in the
-repository URL, git command-line arguments, logs, the ARK Tool schema, or the
-Agent prompt. Leave `gitlab.tokenSecret.name` empty for public GitHub.
+`values.yaml` keys:
 
-To exercise a real private GitLab repository from this machine:
+```yaml
+gitlab:
+  tokenSecret:
+    name: ""      # set to gitlab-token (or pass --set above)
+    key: token
+```
 
-```bash
-set GITLAB_TOKEN=<GITLAB_PAT>
-set GITLAB_E2E_REPOSITORY=https://gitlab.example.com/group/project
-set GITLAB_E2E_REF=main
+The collector injects `GITLAB_TOKEN` from that Secret and authenticates with a host-scoped HTTP `Authorization` header. The token is never placed in the clone URL, git argv, logs, or the Agent prompt.
+
+`ref` is a branch, tag, or commit. If omitted, the default branch is used. If the ref does not exist, collection fails.
+
+## Usage
+
+```powershell
+ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot"
+```
+
+That single Query runs `repository-pipeline` → `repository-documentation` → `repository-collector` → `documentation-renderer` → HTML. You do not retrieve or paste the JSON. There is no standalone documentation Query.
+
+Optional ref (also accepted as `branch: …`):
+
+```powershell
+ark query agent/repository-pipeline "Document this repository: https://gitlab.example.com/group/project ref: develop"
+```
+
+
+
+## Output
+
+Pipeline success looks like:
+
+```text
+✓ Repository collected
+✓ Documentation generated
+✓ HTML rendered
+
+Output:
+github-mcp-chatbot.html
+```
+
+The file is:
+
+```text
+C:\Users\moham\source\repos\repository-documentation\out\github-mcp-chatbot.html
+```
+
+Mechanism (not a Windows Kubernetes `hostPath`):
+
+```text
+Windows host:
+C:\Users\moham\source\repos\repository-documentation\out
+        ↓  docker bind mount
+container documentation-renderer-host:
+/mnt/output
+        ↑
+in-cluster Service documentation-renderer:8080
+        → Endpoints 192.168.65.254:18080  (documentation-renderer-host)
+```
+
+`values.yaml` `renderer.output.hostDocker`, `hostIP` (`192.168.65.254`), and `hostPort` (`18080`) wire that Service. Filenames are derived from the repository name and sanitized (no path traversal).
+
+## Generated documentation
+
+The documentation Agent fills `spec.outputSchema`. The renderer turns that JSON into HTML with these sections:
+
+1. Repository Overview
+  - Quick Start
+2. Repository Structure
+3. Tools & Technologies Used
+4. Core Concepts & Architecture
+  - Request Flow
+  - Build & Packaging Flow
+5. Categorized Technical Information
+  - Main APIs / Endpoints
+  - Main Services / Mediators
+  - DTOs / Schemas / Metadata
+  - Security Components
+  - Configurations
+  - Entry Points
+  - Tests
+  - Risks / Technical Debt
+6. Developer Onboarding Guide
+  - First 30 Minutes
+  - Production Bug Investigation
+  - Critical Files
+  - Common Mistakes
+
+Grounding rules (documentation Agent prompt):
+
+- The collector dump is the only source of truth.
+- Do not invent files, functions, endpoints, env vars, commands, or behaviour.
+- Cite relative paths for concrete claims.
+- Mark inferences (`Inferred: …`).
+- If something cannot be determined, say so.
+- Treat excluded files as unseen.
+
+
+
+## Observability
+
+ARK Dashboard (installed with ARK 0.1.68):
+
+```powershell
+kubectl port-forward svc/ark-dashboard 3000:3000
+```
+
+Open [http://localhost:3000](http://localhost:3000) to inspect Agents, Tools, and Queries.
+
+Live tool-call events for a Query:
+
+```powershell
+ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot" -o events-pretty
+```
+
+The normal Query response stays short; it does not embed the HTML.
+
+## Error handling
+
+Collector HTTP statuses:
+
+
+| Status | Meaning                                                                 |
+| ------ | ----------------------------------------------------------------------- |
+| 400    | Invalid URL, empty input, or unclassified git failure                   |
+| 401    | Git authentication failed (git 401/403 and similar access-denied cases) |
+| 404    | Repository not found, or requested `ref` does not exist                 |
+| 413    | Request body too large                                                  |
+| 504    | Clone timed out                                                         |
+
+
+The pipeline Agent stops after a failed stage and does not call the renderer or invent HTML. A missing `ref` does not fall back to another branch.
+
+## Testing
+
+```powershell
+python tests/test_collector.py            # collector, renderer unit tests, pipeline config
+python tests/test_collector.py --network  # live clone of the GitHub test repo
+python tests/test_collector.py --e2e      # deployed repository-pipeline Query and HTML artifact
+```
+
+Optional private GitLab collector test (local process; token stays in the environment, not in Git). This is separate from the cluster Secret used by the deployed collector:
+
+```powershell
+$env:GITLAB_TOKEN="<YOUR_GITLAB_PAT>"
+$env:GITLAB_E2E_REPOSITORY="https://gitlab.example.com/group/project"
+$env:GITLAB_E2E_REF="main"
 python tests/test_collector.py
 ```
 
-`GITLAB_E2E_REF` may be a branch, a tag, or a commit SHA. The default suite
-passes when those variables are unset.
 
-## Configuration
 
-| Value | Default | Purpose |
-| --- | --- | --- |
-| `collector.name` | `repository-collector` | Service name; must match the Tool URL |
-| `collector.port` | `8080` | Service port; must match the Tool URL |
-| `collector.image.repository` | `localhost:5000/repository-documentation-repository-collector` | Image to run |
-| `collector.workspaceSizeLimit` | `2Gi` | Disk budget for clones |
-| `collector.localRepoRoot` | `""` | Restrict local-path collection to this directory |
-| `gitlab.tokenSecret.name` | `""` | Existing Secret that holds a GitLab PAT |
-| `gitlab.tokenSecret.key` | `token` | Key inside that Secret |
+## Security
 
-Per-request limits (`max_file_bytes`, `max_total_bytes`) are set in
-`tools/repository-collector.yaml` under `http.bodyParameters`.
+- GitLab PAT: Kubernetes Secret only; host-scoped git `extraHeader`; redacted from URLs, argv, child env, and logs.
+- Collector drops `.env`, private keys, binaries, lockfiles, and dependency/cache/`.git` directories; `.env.example` is kept.
+- Renderer HTML-escapes repository content (no raw script injection).
+- Collector Deployment: non-root, read-only root filesystem, dropped capabilities. The renderer image also runs as uid 1001; with `hostDocker` it is the host container `documentation-renderer-host`, not an in-cluster pod.
+- No API keys or tokens in this repository. `.env` is gitignored.
 
-## Known limitations
 
-- The whole repository is sent to the model in one request, so repositories
-  larger than the model's context window will be truncated by `max_total_bytes`.
-  Chunked or hierarchical analysis is not implemented.
-- The six-section structure is enforced by the prompt, not by
-  `spec.outputSchema`. With `gpt-4o-mini` this required an explicit heading
-  checklist; a stronger model or a structured output schema would be more robust.
-- GitLab private repositories require a Kubernetes Secret and
-  `gitlab.tokenSecret.name`. Public GitHub collection does not.
-- The Tool URL hardcodes the `default` namespace.
+
+## Limitations
+
+- The full dump is one model request. Repositories larger than the context window are capped at `max_total_bytes` (250000) / `max_file_bytes` (80000) in `tools/repository-collector.yaml`.
+- Tool HTTP URLs are hardcoded to the `default` namespace.
+- Docker Desktop Kubernetes cannot mount a Windows directory as a pod `hostPath`; HTML reaches the host through the Docker bind above.
+- Local filesystem collection exists inside the collector container only. It is not a supported user-facing pipeline input.
+
+
+
+## Future work
+
+Not implemented as user-facing features:
+
+- Local repository support (host-path / workstation repos as pipeline input)
+- Incremental documentation for repositories larger than the collector byte budget
+- LangFuse for observability.
+- Files Prioritization
+- UI
+- Private GitHub
+- LLM Analyzer
+

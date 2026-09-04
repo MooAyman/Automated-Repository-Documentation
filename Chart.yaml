@@ -1,15 +1,14 @@
 apiVersion: v2
 name: repository-documentation
-description: A Helm chart for repository-documentation - Agents at Scale project
+description: ARK Helm chart that turns a Git repository into standalone HTML developer documentation
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-home: https://github.com/your-org/repository-documentation
+home: https://github.com/MooAyman/Automated-Repository-Documentation
 sources:
-  - https://github.com/your-org/repository-documentation
+  - https://github.com/MooAyman/Automated-Repository-Documentation
 maintainers:
-  - name: Your Team
-    email: your-team@example.com
+  - name: MooAyman
 keywords:
   - agents
   - ai

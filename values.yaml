@@ -1,41 +1,11 @@
-# Default values for repository-documentation
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
+# Values consumed by templates/. Install namespace comes from `helm --namespace`
+# (Tool URLs are hardcoded to default.svc.cluster.local).
 
-# Project configuration
 project:
   name: repository-documentation
-  namespace: repository-documentation
 
-# Image configuration
-image:
-  registry: localhost:5000
-  tag: latest
-  pullPolicy: IfNotPresent
-
-# Model configurations
-# Models are deployed from the models/ directory
-# Edit files in models/ to configure your model providers
-
-# Agent configurations
-# Agents are deployed from the agents/ directory
-# Edit files in agents/ to configure your agents
-
-# Team configurations
-# Teams are deployed from the teams/ directory
-# Edit files in teams/ to configure your teams
-
-# Query configurations
-# Queries are deployed from the queries/ directory
-# Edit files in queries/ to configure your queries
-
-# Tools configuration
-# Tools are deployed from the tools/ directory as YAML files
-# Each .yaml file in tools/ is automatically deployed
-
-# Repository Collector - HTTP service backing the `repository-collector` ARK Tool.
-# NOTE: `name` and `port` must stay in sync with the URL hardcoded in
-# tools/repository-collector.yaml, which cannot interpolate Helm values.
+# HTTP service backing the `repository-collector` ARK Tool.
+# `name` and `port` must stay in sync with the URL in tools/repository-collector.yaml.
 collector:
   enabled: true
   name: repository-collector
@@ -72,7 +42,7 @@ gitlab:
     name: ""
     key: token
 
-# HTML renderer - HTTP service backing the `documentation-renderer` ARK Tool.
+# HTTP service backing the `documentation-renderer` ARK Tool.
 # `name` and `port` must stay in sync with tools/documentation-renderer.yaml.
 renderer:
   enabled: true
@@ -95,6 +65,7 @@ renderer:
     #     localhost:5000/repository-documentation-documentation-renderer:m5
     # The in-cluster Service keeps the Tool URL unchanged.
     hostDocker: true
+    # Host bind path for that docker run. Not interpolated by Helm templates.
     windowsPath: C:\Users\moham\source\repos\repository-documentation\out
     hostIP: 192.168.65.254
     hostPort: 18080
@@ -108,26 +79,11 @@ renderer:
       memory: "64Mi"
       cpu: "50m"
 
-# MCP Servers configuration
-# MCP servers are deployed from the mcp-servers/ directory
-# Use 'ark generate mcp-server <name>' to create new MCP servers
-
-# Memory configuration
-memory:
-  enabled: true
-  name: postgres-memory
-  type: postgres
-  url: "http://postgres-memory:8080"
-
-# Security
 security:
-  # Pod security context
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1001
     fsGroup: 2000
-
-  # Container security context
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
@@ -137,80 +93,17 @@ security:
       drop:
         - ALL
 
-# Service configuration
-service:
-  type: ClusterIP
-  port: 8000
-  targetPort: 8000
-
-# Ingress configuration
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts:
-    - host: repository-documentation.local
-      paths:
-        - path: /
-          pathType: Prefix
-  tls: []
-
-# Resource defaults
-resources:
-  limits:
-    memory: "1Gi"
-    cpu: "1000m"
-  requests:
-    memory: "512Mi"
-    cpu: "500m"
-
-# Node selection
 nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Monitoring
-monitoring:
-  enabled: false
-  serviceMonitor:
-    enabled: false
-    interval: 30s
-
-# Logging
+# LOG_LEVEL on collector and renderer containers.
 logging:
   level: INFO
-  format: json
 
-# Environment variables
-env: {}
-
-# Additional labels
 labels: {}
 
-# Additional annotations
-annotations: {}
-
-# Service Account configuration
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Annotations to add to the service account
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
   name: ""
-
-# Custom secrets (will be created)
-secrets:
-  {}
-  # example-secret:
-  #   data:
-  #     key: value
-
-# Custom config maps
-configMaps:
-  {}
-  # example-config:
-  #   data:
-  #     config.yaml: |
-  #       key: value

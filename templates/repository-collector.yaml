@@ -3,7 +3,7 @@ Repository Collector - the HTTP service that backs the `repository-collector`
 ARK Tool defined in tools/repository-collector.yaml.
 
 Deployed as part of the main release (not as a Helm hook) so that `--wait` blocks
-until the service is ready before the post-install Query hook runs.
+until the service is ready.
 
 The Service name is fixed rather than derived from the release name, because
 tools/repository-collector.yaml is copied verbatim by templates/03-tools.yaml and

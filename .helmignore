@@ -22,3 +22,9 @@
 .vscode/
 # Build artifacts
 resources/
+out/
+.env
+.env.*
+values.local.yaml
+tests/
+*.tgz
