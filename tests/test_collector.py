@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "repository-collector"))
@@ -402,9 +403,23 @@ def _kubectl(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def collector_collect_count() -> int | None:
+def collector_collect_count(since_time: str) -> int | None:
+    """Count successful POST /collect access lines since since_time (RFC3339).
+
+    Uses kubectl --since-time so the count is scoped to this Query, not a
+    sliding --tail window that can drop older matching lines.
+    """
     result = _kubectl(
-        ["kubectl", "logs", "-n", NAMESPACE, "-l", COLLECTOR_LABEL, "--tail=200"]
+        [
+            "kubectl",
+            "logs",
+            "-n",
+            NAMESPACE,
+            "-l",
+            COLLECTOR_LABEL,
+            "--since-time",
+            since_time,
+        ]
     )
     if result.returncode != 0 or result.stdout is None:
         print(f"        could not read collector logs: {(result.stderr or '').strip()}")
@@ -504,10 +519,10 @@ def renderer_artifact(filename: str) -> str | None:
 def test_pipeline_e2e() -> None:
     """One Query to Agent/repository-pipeline. No manual JSON copy."""
     print(f"\npipeline query {PIPELINE_QUERY_NAME} (namespace {NAMESPACE})")
-    collects_before = collector_collect_count()
 
     _kubectl(["kubectl", "delete", "query", PIPELINE_QUERY_NAME, "-n", NAMESPACE, "--ignore-not-found=true"])
     time.sleep(1)
+    since_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     query = {
         "apiVersion": "ark.mckinsey.com/v1alpha1",
@@ -562,13 +577,13 @@ def test_pipeline_e2e() -> None:
     check(re.search(r"Gemini", html, re.I) is not None, "pipeline HTML mentions Gemini")
     check(re.search(r"GitHub MCP|github.?mcp|MCP", html) is not None, "pipeline HTML mentions GitHub MCP")
 
-    collects_after = collector_collect_count()
-    if collects_before is None or collects_after is None:
+    collects = collector_collect_count(since_time)
+    if collects is None:
         check(False, "collector logs are readable after the pipeline Query")
     else:
         check(
-            collects_after == collects_before + 1,
-            f"pipeline caused exactly one collector call (before={collects_before}, after={collects_after})",
+            collects == 1,
+            f"pipeline caused exactly one collector call (since={since_time}, count={collects})",
         )
 
     check(HTML_OUTPUT.is_file(), f"HTML artifact exists on the Windows host ({HTML_OUTPUT})")
