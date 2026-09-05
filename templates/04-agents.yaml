@@ -5,6 +5,6 @@ Agents - Deploy after tools so they can reference Tool CRs.
 {{- range $path, $_ := .Files.Glob "agents/*.yaml" }}
 ---
 {{ $content := $.Files.Get $path }}
-{{- $content | replace "metadata:" "metadata:\n  annotations:\n    \"helm.sh/hook\": pre-install,pre-upgrade\n    \"helm.sh/hook-weight\": \"0\"\n    \"helm.sh/hook-delete-policy\": before-hook-creation" }}
+{{- regexReplaceAll "(?m)^metadata:" $content "metadata:\n  annotations:\n    \"helm.sh/hook\": pre-install,pre-upgrade\n    \"helm.sh/hook-weight\": \"0\"\n    \"helm.sh/hook-delete-policy\": before-hook-creation" }}
 {{- end }}
 {{- end }}
