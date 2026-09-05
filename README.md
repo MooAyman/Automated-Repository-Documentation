@@ -4,10 +4,12 @@ An ARK (Agentic Runtime for Kubernetes) application that turns a GitHub or GitLa
 
 Most repositories still depend on a README that drifts from the code. This project collects the current source, asks a model to fill a strict JSON schema from that dump only, and renders the result to HTML. You give it a URL; you do not copy intermediate JSON.
 
+You can run the same pipeline from the CLI or from the host Streamlit UI.
+
 ## Architecture
 
 ```text
-User
+User  (ark query  or  Streamlit UI)
   ↓  one ARK Query
 Agent/repository-pipeline          orchestrator (no analysis, no HTML)
   ↓  Agent-as-Tool
@@ -23,32 +25,34 @@ Windows host
   C:\Users\moham\source\repos\repository-documentation\out\<repo>.html
 ```
 
-
 | Resource                   | Kind          | Responsibility                                                                                                                            |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `repository-pipeline`      | Agent         | Extract URL and optional `ref`, call the documentation Agent once, pass the JSON unchanged to the renderer, return the artifact filename. |
 | `repository-documentation` | Agent         | Call the collector once, analyse the dump, fill `spec.outputSchema`.                                                                      |
 | `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump.                                                          |
 | `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
+| Streamlit UI (`app/`)      | host client   | Collects URL and optional ref, applies one Query to `repository-pipeline`, then opens or downloads `out/<repo>.html`.                     |
 | ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, the collector Deployment/Service, and the renderer Service (host-backed when `hostDocker` is true).       |
 
-
 Collector and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The documentation Agent owns analysis; the pipeline Agent only sequences the two stages. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
+
+The Streamlit app does not call the collector or renderer. It submits the same Query the CLI uses.
 
 ## Features
 
 - One-command ARK pipeline (`ark query agent/repository-pipeline …`)
+- Streamlit UI that submits that same Query and reads the HTML from `out/`
 - Public GitHub repositories
 - Public GitLab (`gitlab.com` and self-hosted) repositories
 - Private / self-hosted GitLab via a cluster Secret (`GITLAB_TOKEN`); the token is not sent with each query
 - Optional `ref` (branch, tag, or commit); omitted `ref` uses the default branch
 - Missing `ref` fails; the collector does not fall back
+- Dump-grounded documentation prompt with three evidence levels: confirmed, `Inferred:`, and `Not determinable from the repository.` as a last resort
 - Strict structured JSON (`Agent.spec.outputSchema`)
 - Deterministic HTML rendering (no LLM)
 - HTML written to the Windows host `out/` directory
 - Query and tool-call visibility in the ARK Dashboard
-
-
+- Optional Langfuse Cloud traces via ARK OpenTelemetry (no Langfuse SDK in this repo)
 
 ## Prerequisites
 
@@ -114,8 +118,6 @@ docker ps --filter name=documentation-renderer-host
 kubectl get svc,endpoints documentation-renderer
 ```
 
-
-
 ## GitLab private repositories
 
 Public GitHub and public GitLab URLs work with no extra configuration.
@@ -147,6 +149,8 @@ The collector injects `GITLAB_TOKEN` from that Secret and authenticates with a h
 
 ## Usage
 
+### CLI
+
 ```powershell
 ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot"
 ```
@@ -159,7 +163,18 @@ Optional ref (also accepted as `branch: …`):
 ark query agent/repository-pipeline "Document this repository: https://gitlab.example.com/group/project ref: develop"
 ```
 
+### Streamlit UI
 
+The UI is a host-side client. It needs `kubectl` access to the same cluster and namespace (`ARK_NAMESPACE`, default `default`).
+
+```powershell
+pip install -r app\requirements.txt
+python -m streamlit run app\ui.py
+```
+
+Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. The app applies one Query to `agent/repository-pipeline` (timeout 15m), waits for `done`, and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
+
+The UI does not change Agents, Tools, prompts, or schemas.
 
 ## Output
 
@@ -226,13 +241,13 @@ Grounding rules (documentation Agent prompt):
 - The collector dump is the only source of truth.
 - Do not invent files, functions, endpoints, env vars, commands, or behaviour.
 - Cite relative paths for concrete claims.
-- Mark inferences (`Inferred: …`).
-- If something cannot be determined, say so.
+- Three evidence levels: confirmed (plain statement + path), `Inferred: …`, and `Not determinable from the repository.` only as a last resort.
+- Document the interfaces that exist (HTTP, CLI, Agent/Tool, YAML/JSON/typed schemas). Do not require REST or a type named DTO.
 - Treat excluded files as unseen.
 
-
-
 ## Observability
+
+### ARK Dashboard
 
 ARK Dashboard (installed with ARK 0.1.68):
 
@@ -250,10 +265,24 @@ ark query agent/repository-pipeline "Document this repository: https://github.co
 
 The normal Query response stays short; it does not embed the HTML.
 
+### Langfuse Cloud
+
+ARK can export traces to Langfuse Cloud through its built-in OpenTelemetry support. This project does not include a Langfuse SDK. `ark-controller` and `ark-completions` already mount the optional Secret `otel-environment-variables`.
+
+Create a Langfuse Cloud project, then create that Secret in `ark-system` and `default`. Do not commit keys. Full commands are in [`observability/langfuse-cloud.md`](observability/langfuse-cloud.md).
+
+After creating or updating the Secret:
+
+```powershell
+kubectl rollout restart deployment/ark-controller -n ark-system
+kubectl rollout restart deployment/ark-completions -n ark-system
+```
+
+Run a pipeline Query, then confirm a trace in the Langfuse Cloud project. Token usage and cost appear when the model/provider telemetry includes them.
+
 ## Error handling
 
 Collector HTTP statuses:
-
 
 | Status | Meaning                                                                 |
 | ------ | ----------------------------------------------------------------------- |
@@ -262,7 +291,6 @@ Collector HTTP statuses:
 | 404    | Repository not found, or requested `ref` does not exist                 |
 | 413    | Request body too large                                                  |
 | 504    | Clone timed out                                                         |
-
 
 The pipeline Agent stops after a failed stage and does not call the renderer or invent HTML. A missing `ref` does not fall back to another branch.
 
@@ -274,6 +302,8 @@ python tests/test_collector.py --network  # live clone of the GitHub test repo
 python tests/test_collector.py --e2e      # deployed repository-pipeline Query and HTML artifact
 ```
 
+`--e2e` applies one Query to `repository-pipeline` and asserts exactly one successful `POST /collect` in collector logs since that Query started.
+
 Optional private GitLab collector test (local process; token stays in the environment, not in Git). This is separate from the cluster Secret used by the deployed collector:
 
 ```powershell
@@ -283,7 +313,25 @@ $env:GITLAB_E2E_REF="main"
 python tests/test_collector.py
 ```
 
+## Project structure
 
+```text
+agents/                         ARK Agent CRs (pipeline + documentation)
+app/                            Streamlit UI (host-side Query client)
+  ui.py
+  ark_client.py
+  requirements.txt
+  assets/aman-logo.png
+observability/langfuse-cloud.md Langfuse Cloud OTEL setup
+templates/                      Helm templates (RBAC, Tools, Agents, collector, renderer Service)
+tools/                          Tool CRs and HTTP service source
+  repository-collector/
+  documentation-renderer/
+tests/test_collector.py         Collector, renderer, pipeline config, and --e2e
+values.yaml
+Chart.yaml
+out/                            Generated HTML (host bind; not a pipeline input)
+```
 
 ## Security
 
@@ -292,8 +340,7 @@ python tests/test_collector.py
 - Renderer HTML-escapes repository content (no raw script injection).
 - Collector Deployment: non-root, read-only root filesystem, dropped capabilities. The renderer image also runs as uid 1001; with `hostDocker` it is the host container `documentation-renderer-host`, not an in-cluster pod.
 - No API keys or tokens in this repository. `.env` is gitignored.
-
-
+- Langfuse keys belong only in the cluster Secret `otel-environment-variables`, never in Git.
 
 ## Limitations
 
@@ -301,8 +348,7 @@ python tests/test_collector.py
 - Tool HTTP URLs are hardcoded to the `default` namespace.
 - Docker Desktop Kubernetes cannot mount a Windows directory as a pod `hostPath`; HTML reaches the host through the Docker bind above.
 - Local filesystem collection exists inside the collector container only. It is not a supported user-facing pipeline input.
-
-
+- The Streamlit UI requires a working `kubectl` context and a deployed chart; it is not an in-cluster service.
 
 ## Future work
 
@@ -310,7 +356,6 @@ Not implemented as user-facing features:
 
 ### Documentation Quality
 
-- Better Documentation Prompt
 - Evidence / Source References
 
 ### Repository Coverage
@@ -328,10 +373,4 @@ Not implemented as user-facing features:
 
 ### Observability & Evaluation
 
-- LangFuse for observability
 - Automated Documentation Evals
-
-### User Experience
-
-- Web UI for browsing generated documentation
-
