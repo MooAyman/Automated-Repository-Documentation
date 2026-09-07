@@ -1,3 +1,4 @@
+# Role-Based Access Control
 {{/*
 RBAC - Deploy FIRST to ensure permissions are available
 Creates ServiceAccount and necessary RoleBindings for ARK resources

@@ -1,3 +1,4 @@
+# configuration values for the Helm chart
 # Values consumed by templates/. Install namespace comes from `helm --namespace`
 # (Tool URLs are hardcoded to default.svc.cluster.local).
 

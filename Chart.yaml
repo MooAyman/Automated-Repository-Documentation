@@ -1,3 +1,4 @@
+# Helm Chart
 apiVersion: v2
 name: repository-documentation
 description: ARK Helm chart that turns a Git repository into standalone HTML developer documentation
