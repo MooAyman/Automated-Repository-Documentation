@@ -29,7 +29,7 @@ SEPARATOR = "=" * 50
 RULE = "-" * 50
 
 DEFAULT_MAX_FILE_BYTES = 80_000
-DEFAULT_MAX_TOTAL_BYTES = 250_000
+DEFAULT_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 DEFAULT_CLONE_TIMEOUT_SECONDS = 300
 
 # Directories that never carry first-party source code.
@@ -342,11 +342,15 @@ def _assert_ref_checked_out(repo_dir: str, requested: str) -> None:
             f"Requested ref not found: '{requested}' could not be resolved",
             status=404,
         )
-    if _SHA_RE.match(requested) and not commit.lower().startswith(requested.lower()):
-        raise CollectorError(
-            f"Requested ref not found: checked-out commit {commit[:12]} does not match '{requested}'",
-            status=404,
-        )
+    if _SHA_RE.match(requested):
+        left = commit.lower()
+        right = requested.lower()
+        matched = left == right if len(right) >= 40 else left.startswith(right)
+        if not matched:
+            raise CollectorError(
+                f"Requested ref not found: checked-out commit {commit[:12]} does not match '{requested}'",
+                status=404,
+            )
 
 
 def clone_remote(source: str, ref: str, dest: str) -> None:
@@ -408,6 +412,29 @@ def _skip_dir(name: str) -> bool:
     return name in EXCLUDED_DIRS or name.endswith(EXCLUDED_DIR_SUFFIXES)
 
 
+def path_skip_reason(rel_path: str) -> str:
+    """Why a relative path is not collectable, ignoring size and content.
+
+    Same directory and filename rules ``scan()`` applies before reading a file.
+    Used by ``/collect`` and ``/changes`` so they cannot disagree on eligibility.
+    """
+    normalized = (rel_path or "").replace("\\", "/").strip("/")
+    if not normalized or normalized in (".", ".."):
+        return "excluded: invalid path"
+    parts = [part for part in normalized.split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        return "excluded: invalid path"
+    for part in parts[:-1]:
+        if _skip_dir(part):
+            return "excluded: directory"
+    return _skip_reason(parts[-1], size=0, max_file_bytes=DEFAULT_MAX_FILE_BYTES)
+
+
+def is_collectable_path(rel_path: str) -> bool:
+    """True when ``/collect`` would treat this path as eligible repository content."""
+    return path_skip_reason(rel_path) == ""
+
+
 def _skip_reason(name: str, size: int, max_file_bytes: int) -> str:
     lower = name.lower()
     if lower in ALLOWED_ENV_FILES:
@@ -425,20 +452,31 @@ def _skip_reason(name: str, size: int, max_file_bytes: int) -> str:
     return ""
 
 
+def content_skip_reason(raw: bytes) -> str:
+    """Why file bytes are not collectable (NUL or undecodable). Empty if readable."""
+    if b"\x00" in raw[:8192]:
+        return "excluded: binary or undecodable content"
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+        if text.count("\uFFFD") > max(16, len(text) // 100):
+            return "excluded: binary or undecodable content"
+    return ""
+
+
 def _read_text(path: Path) -> str | None:
     """Return normalized text, or None when the file looks binary."""
     try:
         raw = path.read_bytes()
     except OSError:
         return None
-    if b"\x00" in raw[:8192]:
+    if content_skip_reason(raw):
         return None
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("utf-8", errors="replace")
-        if text.count("\uFFFD") > max(16, len(text) // 100):
-            return None
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -465,7 +503,9 @@ def scan(root: str, max_file_bytes: int, max_total_bytes: int) -> list[FileEntry
     entries: list[FileEntry] = []
     budget = max_total_bytes
     for rel, full, size in candidates:
-        reason = _skip_reason(full.name, size, max_file_bytes)
+        reason = path_skip_reason(rel)
+        if not reason:
+            reason = _skip_reason(full.name, size, max_file_bytes)
         if reason:
             entries.append(FileEntry(rel, size, False, reason))
             continue
@@ -481,6 +521,15 @@ def scan(root: str, max_file_bytes: int, max_total_bytes: int) -> list[FileEntry
         budget -= len(text)
         entries.append(FileEntry(rel, size, True, "", text))
     return entries
+
+
+def current_commit_bodies(entries: list[FileEntry]) -> dict[str, str]:
+    """Current-commit file bodies. Excluded or budget-omitted files have no body.
+
+    Incremental state must use this view: a previous body is never current
+    content when the current commit excluded the file.
+    """
+    return {entry.path: (entry.text if entry.included else "") for entry in entries}
 
 
 def render_tree(rel_paths: list[str]) -> str:
@@ -566,9 +615,10 @@ def collect_into(
 
     if is_remote(source):
         validate_remote_url(source)
-        with tempfile.TemporaryDirectory(prefix="repo-collect-") as workdir:
-            repo_dir = os.path.join(workdir, "repo")
-            clone_remote(source, ref, repo_dir)
+        from workspace import open_remote
+
+        pin = ref if _SHA_RE.match(ref) else ""
+        with open_remote(source, ref=ref, commit=pin) as repo_dir:
             commit, branch = _git_metadata(repo_dir)
             return Collection(
                 name=name,

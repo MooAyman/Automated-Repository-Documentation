@@ -14,7 +14,7 @@ collector:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-collector
-    tag: m7
+    tag: m12
     # Docker Desktop Kubernetes caches :latest; bump this tag when the image changes.
     pullPolicy: IfNotPresent
   # Disk budget for transient clones (mounted at /tmp).
@@ -60,7 +60,7 @@ analyzer:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-analyzer
-    tag: m1
+    tag: m2
     pullPolicy: IfNotPresent
   workspaceSizeLimit: 64Mi
   resources:
@@ -81,7 +81,7 @@ mapper:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-map
-    tag: m1
+    tag: m2
     pullPolicy: IfNotPresent
   workspaceSizeLimit: 64Mi
   resources:

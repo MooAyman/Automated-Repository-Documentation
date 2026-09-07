@@ -215,10 +215,34 @@ st.markdown(
 )
 
 
+def _load_existing_artifact(filename: str) -> None:
+    if not filename:
+        return
+    try:
+        path = ark_client.artifact_path(filename)
+    except ValueError:
+        return
+    if path.is_file():
+        st.session_state["last_artifact"] = filename
+        st.session_state["last_html"] = path.read_bytes()
+
+
 def _run_pipeline(url: str, ref: str) -> None:
     st.session_state.pop("error", None)
     st.session_state.pop("last_artifact", None)
     st.session_state.pop("last_html", None)
+    st.session_state.pop("status", None)
+
+    try:
+        plan = ark_client.plan_documentation(url, ref)
+    except Exception as exc:
+        st.session_state["error"] = str(exc)
+        return
+
+    if plan["status"] == "already_documented":
+        st.session_state["status"] = "already_documented"
+        _load_existing_artifact(plan.get("artifact") or "")
+        return
 
     progress = st.empty()
     progress.markdown(
@@ -232,45 +256,54 @@ def _run_pipeline(url: str, ref: str) -> None:
             label = f"Generating documentation… ({phase})"
         progress.markdown(f'<p class="aman-progress">{label}</p>', unsafe_allow_html=True)
 
-    try:
-        message = ark_client.build_input(url, ref)
-        name = ark_client.query_name(url)
-        ark_client.apply_pipeline_query(name, message)
-        obj = ark_client.wait_for_query(name, on_phase=on_phase)
-    except Exception as exc:
-        progress.empty()
-        st.session_state["error"] = str(exc)
-        return
+    def run_pipeline(_plan: dict) -> dict:
+        try:
+            message = ark_client.build_input(
+                url,
+                ref,
+                previous_commit=plan.get("previousCommit") or "",
+                new_commit=plan.get("currentCommit") or "",
+            )
+            name = ark_client.query_name(url)
+            ark_client.apply_pipeline_query(name, message)
+            obj = ark_client.wait_for_query(name, on_phase=on_phase)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
-    phase = (obj.get("status") or {}).get("phase")
-    content = ark_client.query_response(obj)
-    if phase != "done":
-        progress.empty()
-        st.session_state["error"] = content or f"Pipeline stopped (phase={phase})"
-        return
+        phase = (obj.get("status") or {}).get("phase")
+        content = ark_client.query_response(obj)
+        if phase != "done":
+            return {"ok": False, "error": content or f"Pipeline stopped (phase={phase})"}
 
-    filename = ark_client.filename_from_response(content)
-    if not filename:
-        progress.empty()
-        st.session_state["error"] = "The pipeline finished without an HTML filename."
-        return
+        filename = ark_client.filename_from_response(content)
+        if not filename:
+            return {"ok": False, "error": "The pipeline finished without an HTML filename."}
 
-    path = ark_client.artifact_path(filename)
-    if not path.is_file():
-        progress.empty()
-        st.session_state["error"] = f"{filename} was named, but the file is not on disk yet."
-        return
+        path = ark_client.artifact_path(filename)
+        if not path.is_file():
+            return {"ok": False, "error": f"{filename} was named, but the file is not on disk yet."}
+        return {"ok": True, "artifact": filename}
 
-    st.session_state["last_artifact"] = filename
-    st.session_state["last_html"] = path.read_bytes()
+    result = ark_client.execute_documentation_plan(plan, run_pipeline=run_pipeline)
     progress.empty()
+    if result["status"] == "failed":
+        st.session_state["error"] = result.get("error") or "Pipeline failed"
+        return
+
+    st.session_state["status"] = "documented"
+    filename = result.get("artifact") or ""
+    if filename:
+        path = ark_client.artifact_path(filename)
+        st.session_state["last_artifact"] = filename
+        st.session_state["last_html"] = path.read_bytes()
 
 
-def _success(filename: str, data: bytes) -> None:
+def _success(filename: str, data: bytes, *, already: bool = False) -> None:
+    kicker = "Already documented" if already else "Documentation generated"
     st.markdown(
         f"""
         <div class="aman-success">
-          <p class="aman-kicker">Documentation generated</p>
+          <p class="aman-kicker">{kicker}</p>
           <p class="aman-file">{html.escape(filename)}</p>
         </div>
         """,
@@ -342,8 +375,14 @@ def main() -> None:
 
         filename = st.session_state.get("last_artifact")
         data = st.session_state.get("last_html")
+        already = st.session_state.get("status") == "already_documented"
         if filename and data:
-            _success(filename, data)
+            _success(filename, data, already=already)
+        elif already:
+            st.markdown(
+                '<p class="aman-progress">This commit is already documented.</p>',
+                unsafe_allow_html=True,
+            )
 
 
 if __name__ == "__main__":

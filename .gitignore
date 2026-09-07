@@ -10,6 +10,7 @@ values.local.yaml
 
 # Generated HTML and Helm packages
 out/
+state/
 *.tgz
 
 # Python

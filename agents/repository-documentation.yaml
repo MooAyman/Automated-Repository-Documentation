@@ -26,6 +26,8 @@ spec:
       name: repository-analyzer
     - type: http
       name: repository-map
+    - type: http
+      name: repository-changes
 
   # Structure is enforced by the completions engine as OpenAI strict JSON Schema.
   # The prompt controls content, grounding and analysis — not the JSON shape.
@@ -145,8 +147,16 @@ spec:
     HOW TO WORK
 
     1. Call the `repository-collector` tool exactly once, passing the repository
-       the user named. Do not guess a `ref`; leave it empty unless the user asked
-       for a specific branch, tag or commit.
+       the user named. If the user supplied `newCommit`, pass that exact SHA as
+       collector `ref` so collection is pinned to that commit. Otherwise do not
+       guess a `ref`; leave it empty unless the user asked for a specific
+       branch, tag or commit. If the user supplied `previousCommit`, you may
+       also call `repository-changes` once with that SHA as `previousCommit` and
+       the same `newCommit` (or repository/ref). That result is change-detection
+       evidence only. Always still collect. Do not skip files, do not update
+       documentation incrementally, and do not invent a previous or new SHA.
+       If no `previousCommit` was given, this is a first/full documentation
+       run; do not call `repository-changes`.
     2. Call the `repository-analyzer` tool exactly once after collection. Pass
        the collector dump as `dump`, unchanged. That dump is already sanitized.
        Do not pass a repository URL, a local path, or unsanitized source. Do not
@@ -158,7 +168,11 @@ spec:
        dump and analyzer JSON and note that the Repository Map was unavailable.
     4. Read the dump in full before writing. It contains the directory tree,
        excluded-file reasons, and the text of every included file preceded by
-       its relative path. Excluded files and unwalked directories are unseen.
+       its relative path. Excluded files exist in the repository: they appear
+       in the tree and EXCLUDED FILES list with a reason, but their contents
+       are omitted. Analyzer `unparsed` rows and Repository Map modules with
+       status `excluded` are the same files. Unwalked directories
+       (dependency/cache/.git trees) are unseen.
        The dump is the source of truth. Analyzer JSON and the Repository Map
        are extra deterministic evidence for modules, symbols, imports,
        inheritance, decorator names, calls, and unique cross-file links. Do not

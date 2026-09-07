@@ -1,0 +1,63 @@
+# ARK Tool: deterministic Git file-change detection.
+#
+# Backed by the repository-collector HTTP service (POST /changes).
+# Does not collect file contents, parse AST, or call a language model.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-changes
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Deterministically lists files that changed between two commits in a
+    GitHub or GitLab repository. Returns previousCommit, newCommit, and
+    changed files with status added, modified, deleted, or renamed.
+    Omit previousCommit for a first/full documentation run (mode=full,
+    empty changed list). This does not replace repository-collector and
+    must not be used to skip collection. Do not invent a previous SHA.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    properties:
+      repository:
+        type: string
+        description: >-
+          The repository: an https Git URL (GitHub, gitlab.com, or
+          self-hosted GitLab). Do not include credentials. An absolute
+          path is only valid inside the collector container.
+      ref:
+        type: string
+        description: >-
+          Optional Git ref for the new side: branch, tag, or commit SHA.
+          Leave empty to use the default branch. Do not guess a ref.
+      previousCommit:
+        type: string
+        description: >-
+          Optional previously documented commit SHA. Leave empty for the
+          first/full documentation run. Must be a SHA, not a branch name.
+          If it does not exist, detection fails; it will not fall back.
+      newCommit:
+        type: string
+        description: >-
+          Optional new commit SHA. When set, it is used instead of ref
+          for the new side. Must be a SHA if provided.
+    required:
+      - repository
+  http:
+    url: http://repository-collector.default.svc.cluster.local:8080/changes
+    method: POST
+    timeout: 300s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {
+        "repository": "{{.input.repository}}",
+        "ref": "{{if .input.ref}}{{.input.ref}}{{end}}",
+        "previousCommit": "{{if .input.previousCommit}}{{.input.previousCommit}}{{end}}",
+        "newCommit": "{{if .input.newCommit}}{{.input.newCommit}}{{end}}"
+      }

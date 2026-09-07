@@ -1,14 +1,19 @@
 """Minimal HTTP wrapper around the repository collector.
 
 Exposes the collector as an endpoint that an ARK `Tool` of `type: http` can call.
-Standard library only - no web framework is needed for two endpoints.
+Standard library only - no web framework is needed for three endpoints.
 
-    GET  /health   -> "ok"
-    POST /collect  -> text/plain repository dump
+    GET  /health    -> "ok"
+    POST /collect   -> text/plain repository dump
+    POST /changes   -> application/json commit file changes
 
-Request body (JSON):
+Request body for /collect (JSON):
     {"repository": "<url or local path>", "ref": "<optional branch/tag>",
-     "max_file_bytes": 80000, "max_total_bytes": 250000}
+     "max_file_bytes": 80000, "max_total_bytes": 209715200}
+
+Request body for /changes (JSON):
+    {"repository": "<url or local path>", "ref": "<optional new ref>",
+     "previousCommit": "<optional SHA>", "newCommit": "<optional SHA>"}
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from changes import detect_changes
 from collector import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_TOTAL_BYTES,
@@ -71,7 +77,11 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, f"unknown path: {self.path}")
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/collect":
+        path = self.path.rstrip("/")
+        if path == "/changes":
+            self._changes()
+            return
+        if path != "/collect":
             self._respond(404, f"unknown path: {self.path}")
             return
 
@@ -152,6 +162,82 @@ class Handler(BaseHTTPRequestHandler):
             elapsed_ms,
         )
         self._respond(200, dump)
+
+    def _changes(self) -> None:
+        length = _positive_int(self.headers.get("Content-Length"), 0)
+        if length > MAX_REQUEST_BYTES:
+            self._respond(413, "request body too large")
+            return
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("body must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._respond(400, f"invalid JSON request body: {exc}")
+            return
+
+        repository = str(payload.get("repository") or payload.get("url") or "").strip()
+        ref = str(payload.get("ref") or "").strip()
+        previous = str(payload.get("previousCommit") or "").strip()
+        new_commit = str(payload.get("newCommit") or "").strip()
+        if not repository:
+            self._respond(400, "field 'repository' is required (a git URL or a local path)")
+            return
+
+        host, name = source_identity(repository)
+        started = time.monotonic()
+        log.info(
+            "detecting changes host=%s repo=%s previous=%s new=%s requested_ref=%s",
+            host,
+            name,
+            (previous or "<none>")[:12],
+            (new_commit or "<none>")[:12],
+            ref or "<default>",
+        )
+        try:
+            result = detect_changes(
+                repository,
+                previous_commit=previous,
+                ref=ref,
+                new_commit=new_commit,
+                local_root=LOCAL_REPO_ROOT,
+            )
+        except CollectorError as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.warning(
+                "change detection failed host=%s repo=%s result=error elapsed_ms=%d: %s",
+                host,
+                name,
+                elapsed_ms,
+                redact(str(exc)),
+            )
+            self._respond(exc.status, redact(str(exc)))
+            return
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.exception(
+                "unexpected change detection error host=%s repo=%s elapsed_ms=%d",
+                host,
+                name,
+                elapsed_ms,
+            )
+            self._respond(500, f"unexpected error detecting changes: {redact(str(exc))}")
+            return
+
+        body = json.dumps(result, ensure_ascii=False)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        log.info(
+            "detected changes host=%s repo=%s mode=%s previous=%s new=%s files=%d elapsed_ms=%d result=ok",
+            host,
+            name,
+            result["mode"],
+            (result["previousCommit"] or "<none>")[:12],
+            (result["newCommit"] or "")[:12],
+            len(result["changed"]),
+            elapsed_ms,
+        )
+        self._respond(200, body, "application/json; charset=utf-8")
 
 
 def main() -> int:

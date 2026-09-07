@@ -250,7 +250,8 @@ def build_map(analysis: dict[str, Any]) -> dict[str, Any]:
             continue
         seen.add(path)
         reason = str(item.get("reason") or "unparsed")
-        modules.append(_module_row(path, "unparsed", reason))
+        status = "excluded" if reason.startswith(("excluded:", "omitted:")) else "unparsed"
+        modules.append(_module_row(path, status, reason))
 
     modules.sort(key=lambda row: row["path"])
     relationships = _relationship_rows(analysis.get("references") or [])

@@ -64,4 +64,4 @@ spec:
       - name: max_file_bytes
         value: "80000"
       - name: max_total_bytes
-        value: "250000"
+        value: "209715200"

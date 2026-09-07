@@ -10,8 +10,8 @@ You can run the same pipeline from the CLI or from the host Streamlit UI.
 
 ```text
 User  (ark query  or  Streamlit UI)
-  ↓  Streamlit: host-side URL/ref validation (no LLM, no clone)
-  ↓  one ARK Query
+  ↓  Streamlit: host-side URL/ref validation + last-documented SHA registry
+  ↓  same SHA → already_documented (no Query); otherwise one ARK Query
 Agent/repository-pipeline          orchestrator (no analysis, no HTML)
   ↓  Agent-as-Tool
 Agent/repository-documentation     analysis + spec.outputSchema JSON
@@ -34,27 +34,32 @@ Windows host
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `repository-pipeline`      | Agent         | Extract URL and optional `ref`, call the documentation Agent once, pass the JSON unchanged to the renderer, return the artifact filename. |
 | `repository-documentation` | Agent         | Call collector, analyzer, then map; analyse the dump (source of truth) plus that deterministic evidence; fill `spec.outputSchema`.         |
-| `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump.                                                          |
+| `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump. Same-pipeline `/changes`+`/collect` reuse one workspace. |
 | `repository-analyzer`      | Tool (`http`) | Conservative Python AST on already-sanitized files/dump. Resolves unique same-file and imported cross-file references. Does not clone.    |
 | `repository-map`           | Tool (`http`) | Deterministic Repository Map from analyzer JSON: modules, symbols, relationships, tree. No clone, no AST, no LLM.                         |
+| `repository-changes`       | Tool (`http`) | Deterministic file changes between two commit SHAs (same collector service and inclusion rules). Empty previous SHA is a first/full run. |
 | `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
-| Streamlit UI (`app/`)      | host client   | Validates URL and optional ref, applies one Query to `repository-pipeline`, then opens or downloads `out/<repo>.html`. |
+| Streamlit UI (`app/`)      | host client   | Validates URL/ref, consults the last-documented SHA registry, applies one Query when needed, then opens or downloads `out/<repo>.html`. |
 | ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, collector/analyzer/map Deployments/Services, and the renderer Service (host-backed when `hostDocker` is true). |
 
 Collector, analyzer, map, and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The analyzer accepts only already-sanitized content (never a clone). The map accepts only analyzer JSON. The documentation Agent owns analysis; the pipeline Agent only sequences documentation then render. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
 
-The Streamlit app does not call the collector, analyzer, map, or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses.
+The Streamlit app does not call the collector, analyzer, map, or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses unless that repository is already documented at the current commit. The last documented SHA is stored in `state/documentation-registry.json` (not Streamlit memory and not the HTML file). A raw `ark query` CLI run does not consult this registry.
 
 ## Features
 
 - One-command ARK pipeline (`ark query agent/repository-pipeline …`)
 - Streamlit UI that validates the URL/ref, then submits that same Query and reads the HTML from `out/`
+- Persistent last-documented commit SHA per repository (JSON registry; SHA is written only after a successful generation)
+- Same repository + same SHA returns `already_documented` and skips regeneration
 - Deterministic URL and ref validation before a Query starts (no LLM)
 - Public GitHub repositories
 - Public GitLab (`gitlab.com` and self-hosted) repositories
 - Private / self-hosted GitLab via a cluster Secret (`GITLAB_TOKEN`); the token is not sent with each query
 - Optional `ref` (branch, tag, or commit); omitted `ref` uses the default branch
 - Missing `ref` fails; the collector does not fall back
+- Deterministic Git change detection between two commit SHAs (added/modified/deleted/renamed), filtered by the same collector inclusion rules as `/collect`; no previous SHA means a first/full run
+- Same-pipeline `/changes` and `/collect` reuse one clone; a missing previous SHA is fetched into the shallow checkout without a full clone
 - Deterministic regex redaction of secrets and PII in the collector dump before it reaches the model
 - Deterministic JSON/YAML field redaction by sensitive key names before the dump reaches the model
 - Conservative Python AST analysis (classes, functions, imports, unique cross-file references) on already-sanitized source only
@@ -91,9 +96,9 @@ kubectl get model default
 Build images (Docker Desktop uses the local image store; no `docker push` is required). Tags match `values.yaml`:
 
 ```powershell
-docker build -t localhost:5000/repository-documentation-repository-collector:m7 tools/repository-collector
-docker build -t localhost:5000/repository-documentation-repository-analyzer:m1 tools/repository-analyzer
-docker build -t localhost:5000/repository-documentation-repository-map:m1 tools/repository-map
+docker build -t localhost:5000/repository-documentation-repository-collector:m12 tools/repository-collector
+docker build -t localhost:5000/repository-documentation-repository-analyzer:m2 tools/repository-analyzer
+docker build -t localhost:5000/repository-documentation-repository-map:m2 tools/repository-map
 docker build -t localhost:5000/repository-documentation-documentation-renderer:m5 tools/documentation-renderer
 ```
 
@@ -120,10 +125,10 @@ Verify:
 
 ```powershell
 kubectl get agent repository-pipeline repository-documentation
-kubectl get tool repository-documentation repository-collector repository-analyzer repository-map documentation-renderer
+kubectl get tool repository-documentation repository-collector repository-analyzer repository-map repository-changes documentation-renderer
 ```
 
-Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-analyzer` (http), `repository-map` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
+Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-analyzer` (http), `repository-map` (http), `repository-changes` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
 
 With `renderer.output.hostDocker: true` (this chart's default), there is no in-cluster renderer Deployment. Confirm the host container instead:
 
@@ -334,9 +339,11 @@ agents/                         ARK Agent CRs (pipeline + documentation)
 app/                            Streamlit UI (host-side Query client)
   ui.py
   ark_client.py
+  documentation_registry.py
   validation.py
   requirements.txt
   assets/aman-logo.png
+state/                          Last-documented SHA registry (gitignored; not HTML)
 observability/langfuse-cloud.md Langfuse Cloud OTEL setup
 templates/                      Helm templates (RBAC, Tools, Agents, collector, analyzer, map, renderer Service)
 tools/                          Tool CRs and HTTP service source
@@ -365,11 +372,12 @@ out/                            Generated HTML (host bind; not a pipeline input)
 
 ## Limitations
 
-- The full dump is one model request. Repositories larger than the context window are capped at `max_total_bytes` (250000) / `max_file_bytes` (80000) in `tools/repository-collector.yaml`.
+- The full dump is one model request. Collection uses a per-file cap (`max_file_bytes` 80000) and a 200 MiB total safety ceiling (`max_total_bytes` 209715200) in `tools/repository-collector.yaml`. The total ceiling omits remaining files; it does not truncate them. `/changes` does not apply the total ceiling.
 - Tool HTTP URLs are hardcoded to the `default` namespace.
 - Docker Desktop Kubernetes cannot mount a Windows directory as a pod `hostPath`; HTML reaches the host through the Docker bind above.
 - Local filesystem collection exists inside the collector container only. It is not a supported user-facing pipeline input.
 - The Streamlit UI requires a working `kubectl` context and a deployed chart; it is not an in-cluster service.
+- The last-documented SHA registry is host-side (`state/documentation-registry.json`). `ark query` from the CLI still always runs the full pipeline.
 
 ## Future work
 
@@ -382,7 +390,7 @@ Not implemented as user-facing features:
 ### Repository Coverage
 
 - Intelligent File Selection & Prioritization
-- Incremental documentation for repositories larger than the collector byte budget
+- Incremental documentation generation (change detection exists; affected-file analysis and doc merging do not)
 - Local repository support (host-path / workstation repositories as pipeline input)
 - Private GitHub repository support
 

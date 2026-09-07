@@ -132,10 +132,18 @@ def test_budget_and_errors() -> None:
         root.mkdir()
         build_fixture(root)
 
+        check(collector.DEFAULT_MAX_TOTAL_BYTES == 200 * 1024 * 1024, "total repository budget is 200 MiB")
+        check(collector.DEFAULT_MAX_FILE_BYTES == 80_000, "per-file size limit is unchanged")
+
         entries = collector.scan(str(root), max_file_bytes=1000, max_total_bytes=20)
         omitted = [e for e in entries if "budget" in e.reason]
+        included = [e for e in entries if e.included]
         check(bool(omitted), "total content budget is enforced")
-        check(sum(len(e.text) for e in entries if e.included) <= 20, "included content stays within budget")
+        check(sum(len(e.text) for e in included) <= 20, "included content stays within budget")
+        check(all(e.text == "" for e in omitted), "budget-omitted files have no partial content")
+        for entry in included:
+            on_disk = (root / entry.path).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            check(entry.text == on_disk, "budget does not silently truncate included files")
 
     for bad, label in [("", "empty input"), (os.path.join(tempfile.gettempdir(), "no-such-repo-xyz"), "missing path")]:
         try:
@@ -335,7 +343,7 @@ def test_dump_sanitization() -> None:
         (root / ".env").write_text("SECRET=supersecret\n", encoding="utf-8")
         (root / "secrets.yaml").write_text("password: supersecret\n", encoding="utf-8")
 
-        entries = collector.scan(str(root), max_file_bytes=80_000, max_total_bytes=250_000)
+        entries = collector.scan(str(root), max_file_bytes=80_000, max_total_bytes=collector.DEFAULT_MAX_TOTAL_BYTES)
         included = {e.path for e in entries if e.included}
         skipped = {e.path for e in entries if not e.included}
         check("src/config.py" in included, "content scanner does not replace filename filtering")
@@ -549,11 +557,12 @@ def test_security_verification() -> None:
     check("entry.text" not in server_src, "HTTP handler does not send unsanitized file bodies")
     tools_block = docs.split("prompt:", 1)[0]
     check(
-        tools_block.count("type: http") == 3
+        tools_block.count("type: http") == 4
         and "repository-collector" in tools_block
         and "repository-analyzer" in tools_block
-        and "repository-map" in tools_block,
-        "Documentation Agent receives repository content via collector, then analyzer and map",
+        and "repository-map" in tools_block
+        and "repository-changes" in tools_block,
+        "Documentation Agent receives repository content via collector, then analyzer, map, and changes",
     )
     check("documentation-renderer" not in tools_block, "Documentation Agent does not receive renderer payloads")
     analyzer_src = (ROOT / "tools" / "repository-analyzer" / "analyzer.py").read_text(encoding="utf-8")
@@ -842,9 +851,10 @@ def _host_modules():
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
     import ark_client  # noqa: E402
+    import documentation_registry  # noqa: E402
     import validation  # noqa: E402
 
-    return validation, ark_client
+    return validation, ark_client, documentation_registry
 
 
 def _expect_invalid(validate, error_type, url: str, ref: str, needle: str, label: str) -> None:
@@ -859,7 +869,7 @@ def _expect_invalid(validate, error_type, url: str, ref: str, needle: str, label
 
 def test_input_validation() -> None:
     print("\ninput validation")
-    validation, ark_client = _host_modules()
+    validation, ark_client, _registry = _host_modules()
 
     github, ref = validation.validate_pipeline_input("https://github.com/MooAyman/github-mcp-chatbot")
     check(github == "https://github.com/MooAyman/github-mcp-chatbot" and ref == "", "GitHub HTTPS URL is accepted")
@@ -883,6 +893,13 @@ def test_input_validation() -> None:
     check(tagged == TARGET_REPO and sha_ref == "v1.3.0", "tag ref syntax is accepted")
     _, commit = validation.validate_pipeline_input(TARGET_REPO, "abcdeff")
     check(commit == "abcdeff", "short commit SHA syntax is accepted")
+    check(validation.validate_commit_sha("") == "", "empty previous commit SHA is allowed")
+    check(validation.validate_commit_sha("abcdeff") == "abcdeff", "documented commit SHA syntax is accepted")
+    try:
+        validation.validate_commit_sha("not-a-sha")
+        check(False, "invalid commit SHA is rejected")
+    except validation.ValidationError as exc:
+        check("commit sha" in str(exc).lower(), "invalid commit SHA uses a ValidationError")
     _, missing = validation.validate_pipeline_input(TARGET_REPO, "this-ref-does-not-exist-xyz")
     check(missing == "this-ref-does-not-exist-xyz", "ref existence is not checked here")
     _, branch = validation.validate_pipeline_input(TARGET_REPO, "feature/better-docs")
@@ -972,6 +989,1013 @@ def test_ref_handling() -> None:
                 "Requested ref not found" in str(exc) and exc.status == 404,
                 "nonexistent ref fails clearly and does not fall back",
             )
+
+
+def _change(
+    path: str,
+    status: str,
+    src: str = "",
+    *,
+    eligible: bool = True,
+    reason: str = "",
+) -> dict:
+    row: dict = {"path": path, "status": status, "eligible": eligible}
+    if src:
+        row["from"] = src
+    if reason:
+        row["reason"] = reason
+    return row
+
+
+def build_change_fixture(root: Path) -> dict[str, str]:
+    """Two commits: add, modify, delete, rename, plus an unchanged file."""
+    _git(str(root), "init", "-b", "main")
+    (root / "stay.txt").write_text("unchanged\n", encoding="utf-8")
+    (root / "keep.txt").write_text("version-one\n", encoding="utf-8")
+    (root / "gone.txt").write_text("delete-me\n", encoding="utf-8")
+    (root / "old_name.txt").write_text("rename-me\n", encoding="utf-8")
+    _git(str(root), "add", "stay.txt", "keep.txt", "gone.txt", "old_name.txt")
+    _git(str(root), "commit", "-m", "base")
+    previous = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+
+    (root / "keep.txt").write_text("version-two\n", encoding="utf-8")
+    (root / "added.txt").write_text("new-file\n", encoding="utf-8")
+    _git(str(root), "rm", "gone.txt")
+    _git(str(root), "mv", "old_name.txt", "new_name.txt")
+    _git(str(root), "add", "keep.txt", "added.txt", "new_name.txt")
+    _git(str(root), "commit", "-m", "changes")
+    current = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+    return {"previous": previous, "current": current}
+
+
+def test_git_change_detection() -> None:
+    print("\nGit change detection")
+    if not _git_ok():
+        print("  skip  git is not available on PATH")
+        return
+
+    import changes  # noqa: E402
+    import server as collector_server  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "change-repo"
+        root.mkdir()
+        shas = build_change_fixture(root)
+
+        first = changes.detect_changes(str(root))
+        check(first["schemaVersion"] == "1", "change schemaVersion is 1")
+        check(first["mode"] == "full", "no previous SHA is a first/full run")
+        check(first["previousCommit"] == "", "first run has an empty previousCommit")
+        check(first["newCommit"] == shas["current"], "first run resolves HEAD as newCommit")
+        check(first["changed"] == [], "first run does not invent a change list")
+        check(first == changes.detect_changes(str(root)), "first-run detection is deterministic")
+
+        result = changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        )
+        check(result == changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        ), "incremental detection is deterministic")
+        check(result["mode"] == "incremental", "two SHAs produce an incremental result")
+        check(result["previousCommit"] == shas["previous"], "previousCommit is the resolved old SHA")
+        check(result["newCommit"] == shas["current"], "newCommit is the resolved new SHA")
+        by_path = {row["path"]: row for row in result["changed"]}
+        check(by_path.get("added.txt") == _change("added.txt", "added"), "added file is reported")
+        check(by_path.get("keep.txt") == _change("keep.txt", "modified"), "modified file is reported")
+        check(by_path.get("gone.txt") == _change("gone.txt", "deleted"), "deleted file is reported")
+        check(
+            by_path.get("new_name.txt") == _change("new_name.txt", "renamed", "old_name.txt"),
+            "renamed file is reported",
+        )
+        check("stay.txt" not in by_path, "unchanged file is omitted")
+        check("version-two" not in json.dumps(result) and "delete-me" not in json.dumps(result),
+              "change detection does not include file contents")
+
+        same = changes.detect_changes(
+            str(root),
+            previous_commit=shas["current"],
+            new_commit=shas["current"],
+        )
+        check(same["mode"] == "incremental" and same["changed"] == [],
+              "unchanged repository yields an empty change list")
+
+        try:
+            changes.detect_changes(str(root), previous_commit="not-a-sha")
+            check(False, "invalid previous SHA is rejected")
+        except collector.CollectorError as exc:
+            check(exc.status == 400 and "commit SHA" in str(exc), "invalid previous SHA is a 400")
+
+        missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        try:
+            changes.detect_changes(str(root), previous_commit=missing, new_commit=shas["current"])
+            check(False, "missing previous SHA is rejected")
+        except collector.CollectorError as exc:
+            check(exc.status == 404 and "not found" in str(exc).lower(), "missing previous SHA is a 404")
+
+        try:
+            changes.detect_changes(str(root), new_commit="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            check(False, "missing new SHA is rejected")
+        except collector.CollectorError as exc:
+            check(exc.status == 404, "missing new SHA is a 404")
+
+        dump = collector.collect(str(root))
+        check("version-two" in dump and "FILE: stay.txt" in dump, "collection of the same repo is unchanged")
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), collector_server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/changes",
+                data=json.dumps({
+                    "repository": str(root),
+                    "previousCommit": shas["previous"],
+                    "newCommit": shas["current"],
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                status = response.status
+            check(status == 200 and payload == result, "POST /changes returns the same change JSON")
+            empty = urllib.request.Request(
+                f"http://127.0.0.1:{port}/changes",
+                data=json.dumps({"repository": str(root)}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(empty, timeout=30) as response:
+                full_payload = json.loads(response.read().decode("utf-8"))
+            check(full_payload["mode"] == "full" and full_payload["changed"] == [],
+                  "POST /changes without previousCommit is a first/full run")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+def build_filtered_change_fixture(root: Path) -> dict[str, str]:
+    """Eligible and excluded adds, edits, deletes, and renames in one repo."""
+    _git(str(root), "init", "-b", "main")
+    (root / "src").mkdir()
+    (root / "node_modules" / "left-pad").mkdir(parents=True)
+    (root / "src" / "main.py").write_text("print('v1')\n", encoding="utf-8")
+    (root / "README.md").write_text("# Docs\n", encoding="utf-8")
+    (root / "gone.txt").write_text("delete-me\n", encoding="utf-8")
+    (root / "old_name.txt").write_text("rename-me\n", encoding="utf-8")
+    (root / "leak.txt").write_text("was-public\n", encoding="utf-8")
+    (root / ".env").write_text("SECRET=one\n", encoding="utf-8")
+    (root / ".env.production").write_text("SECRET=prod\n", encoding="utf-8")
+    (root / "secrets.yaml").write_text("token: a\n", encoding="utf-8")
+    (root / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00")
+    (root / "node_modules" / "left-pad" / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
+    _git(str(root), "add", "-f", "-A")
+    _git(str(root), "commit", "-m", "base")
+    previous = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+
+    (root / "src" / "main.py").write_text("print('v2')\n", encoding="utf-8")
+    (root / "src" / "added.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / ".env").write_text("SECRET=two\n", encoding="utf-8")
+    (root / "package-lock.json").write_text('{"lockfileVersion": 3, "x": 1}\n', encoding="utf-8")
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01")
+    (root / "node_modules" / "left-pad" / "index.js").write_text("module.exports = 2\n", encoding="utf-8")
+    (root / "server.key").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+    (root / "yarn.lock").write_text("# yarn\n", encoding="utf-8")
+    (root / ".env.example").write_text("SECRET=changeme\n", encoding="utf-8")
+    _git(str(root), "rm", "gone.txt")
+    _git(str(root), "mv", "old_name.txt", "new_name.txt")
+    _git(str(root), "mv", "leak.txt", ".env.local")
+    _git(str(root), "mv", ".env.production", "config.md")
+    _git(str(root), "mv", "secrets.yaml", "secrets.yml")
+    _git(str(root), "add", "-f", "-A")
+    _git(str(root), "commit", "-m", "mixed")
+    current = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+    return {"previous": previous, "current": current}
+
+
+def test_change_filtering() -> None:
+    print("\nGit change filtering")
+    if not _git_ok():
+        print("  skip  git is not available on PATH")
+        return
+
+    import changes  # noqa: E402
+    import server as collector_server  # noqa: E402
+
+    check(collector.is_collectable_path("src/main.py"), "source path is collectable")
+    check(collector.is_collectable_path("README.md"), "README is collectable")
+    check(collector.is_collectable_path(".env.example"), "allowed env example is collectable")
+    check(not collector.is_collectable_path(".env"), "`.env` is not collectable")
+    check(not collector.is_collectable_path("package-lock.json"), "lockfile is not collectable")
+    check(not collector.is_collectable_path("yarn.lock"), "yarn.lock is not collectable")
+    check(not collector.is_collectable_path("server.key"), "private key is not collectable")
+    check(not collector.is_collectable_path("logo.png"), "binary extension is not collectable")
+    check(not collector.is_collectable_path("node_modules/left-pad/index.js"),
+          "dependency directory is not collectable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "filtered-repo"
+        root.mkdir()
+        shas = build_filtered_change_fixture(root)
+
+        result = changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        )
+        check(result == changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        ), "filtered change detection is deterministic")
+        by_path = {row["path"]: row for row in result["changed"]}
+
+        check(by_path.get("src/added.py") == _change("src/added.py", "added"),
+              "eligible added file is returned")
+        check(by_path.get(".env.example") == _change(".env.example", "added"),
+              "allowed `.env.example` change is returned")
+        check(by_path.get("src/main.py") == _change("src/main.py", "modified"),
+              "eligible modified file is returned")
+        check(by_path.get("gone.txt") == _change("gone.txt", "deleted"),
+              "eligible deleted file is returned")
+        check(
+            by_path.get("new_name.txt") == _change("new_name.txt", "renamed", "old_name.txt"),
+            "eligible-to-eligible rename is returned as renamed",
+        )
+        check(by_path.get("config.md") == _change("config.md", "added"),
+              "excluded-to-eligible rename is returned as added")
+        check(by_path.get("leak.txt") == _change("leak.txt", "deleted"),
+              "eligible-to-excluded rename is returned as deleted")
+
+        excluded = [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "package-lock.json",
+            "yarn.lock",
+            "server.key",
+            "logo.png",
+            "node_modules/left-pad/index.js",
+            "secrets.yaml",
+            "secrets.yml",
+        ]
+        for path in excluded:
+            check(path not in by_path, f"excluded path {path} is not returned")
+        check("SECRET=two" not in json.dumps(result) and "delete-me" not in json.dumps(result),
+              "filtered changes still omit file contents")
+
+        dump = collector.collect(str(root))
+        check("FILE: src/main.py" in dump and "print('v2')" in dump, "collect still includes eligible source")
+        check("FILE: src/added.py" in dump, "collect still includes newly added eligible source")
+        check("FILE: README.md" in dump, "collect still includes unchanged eligible files")
+        check("FILE: .env.example" in dump, "collect still includes allowed env example")
+        check("\nFILE: .env\n" not in dump and "SECRET=two" not in dump, "collect still excludes `.env`")
+        check("FILE: package-lock.json" not in dump and "FILE: yarn.lock" not in dump,
+              "collect still excludes lockfiles")
+        check("FILE: server.key" not in dump, "collect still excludes private keys")
+        check("FILE: logo.png" not in dump, "collect still excludes binaries")
+        check("node_modules" not in dump, "collect still skips dependency directories")
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), collector_server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/changes",
+                data=json.dumps({
+                    "repository": str(root),
+                    "previousCommit": shas["previous"],
+                    "newCommit": shas["current"],
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            check(payload == result, "POST /changes returns the filtered change JSON")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+def test_change_eligibility_and_budget() -> None:
+    print("\nGit change eligibility and collection budget")
+    if not _git_ok():
+        print("  skip  git is not available on PATH")
+        return
+
+    import changes  # noqa: E402
+
+    binary_reason = "excluded: binary or undecodable content"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "budget-repo"
+        root.mkdir()
+        _git(str(root), "init", "-b", "main")
+        (root / "keep.py").write_text("print('v1')\n", encoding="utf-8")
+        (root / "gone_big.py").write_text("OLD-LINE\n" * 12_000, encoding="utf-8")
+        (root / "blob.txt").write_bytes(b"text\x00with-null-bytes")
+        (root / ".env").write_text("SECRET=one\n", encoding="utf-8")
+        _git(str(root), "add", "-f", "-A")
+        _git(str(root), "commit", "-m", "base")
+        previous = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+
+        (root / "keep.py").write_text("print('v2')\n", encoding="utf-8")
+        (root / "added.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / "huge.py").write_text("NEW-FILE-CONTENT\n" * 8_000, encoding="utf-8")
+        (root / "blob.txt").write_bytes(b"text\x00changed-nulls")
+        (root / ".env").write_text("SECRET=two\n", encoding="utf-8")
+        _git(str(root), "rm", "-f", "gone_big.py")
+        _git(str(root), "add", "-f", "-A")
+        _git(str(root), "commit", "-m", "over-budget-mix")
+        current = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+
+        result = changes.detect_changes(str(root), previous_commit=previous, new_commit=current)
+        by_path = {row["path"]: row for row in result["changed"]}
+
+        check(by_path.get("keep.py") == _change("keep.py", "modified"),
+              "small modified file stays eligible")
+        check(by_path.get("added.py") == _change("added.py", "added"),
+              "small added file stays eligible")
+        huge = by_path.get("huge.py") or {}
+        check(
+            huge.get("path") == "huge.py" and huge.get("status") == "added" and huge.get("eligible") is False
+            and "exceeds limit" in str(huge.get("reason") or ""),
+            "oversized added file is still reported as a Git change",
+        )
+        gone_big = by_path.get("gone_big.py") or {}
+        check(
+            gone_big.get("path") == "gone_big.py"
+            and gone_big.get("status") == "deleted"
+            and gone_big.get("eligible") is False
+            and "exceeds limit" in str(gone_big.get("reason") or ""),
+            "oversized deleted file uses previous-commit size, not current content",
+        )
+        check(
+            by_path.get("blob.txt") == _change("blob.txt", "modified", eligible=False, reason=binary_reason),
+            "NUL/binary changed file is still reported as a Git change",
+        )
+        check(".env" not in by_path, "path-excluded secret is still omitted from /changes")
+        dumped = json.dumps(result)
+        check("print('v2')" not in dumped and "SECRET=two" not in dumped and "changed-nulls" not in dumped,
+              "eligibility annotation does not include file contents")
+
+        tiny = collector.scan(str(root), max_file_bytes=80_000, max_total_bytes=20)
+        check("keep.py" in by_path and "added.py" in by_path,
+              "/changes still reports files that exceed the collect total budget")
+        omitted = [e for e in tiny if "budget" in e.reason]
+        check(bool(omitted), "/collect still enforces the total safety ceiling")
+        check(all(e.text == "" for e in omitted), "/collect does not silently truncate when the ceiling is reached")
+        included = [e for e in tiny if e.included]
+        check(sum(len(e.text) for e in included) <= 20, "/collect included content stays within the ceiling")
+
+        default_scan = collector.scan(
+            str(root),
+            max_file_bytes=collector.DEFAULT_MAX_FILE_BYTES,
+            max_total_bytes=collector.DEFAULT_MAX_TOTAL_BYTES,
+        )
+        by_scan = {e.path: e for e in default_scan}
+        check(not by_scan["huge.py"].included and "exceeds limit" in by_scan["huge.py"].reason,
+              "per-file size limit still excludes oversized files from /collect")
+        check(not by_scan["blob.txt"].included and "binary" in by_scan["blob.txt"].reason,
+              "NUL/binary files are still excluded from /collect")
+        check(by_scan["keep.py"].included and by_scan["added.py"].included,
+              "/collect still includes path-eligible files under the per-file limit")
+        check(".env" in by_scan and not by_scan[".env"].included, "/collect still excludes `.env`")
+
+
+def test_excluded_file_visibility() -> None:
+    print("\nexcluded file visibility")
+    sys.path.insert(0, str(ROOT / "tools" / "repository-analyzer"))
+    sys.path.insert(0, str(ROOT / "tools" / "repository-map"))
+    import analyzer  # noqa: E402
+    import mapper  # noqa: E402
+    import changes  # noqa: E402
+
+    sentinel = "OVERSIZE_UNIQUE_PAYLOAD_XYZ"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "visible-repo"
+        root.mkdir()
+        if _git_ok():
+            _git(str(root), "init", "-b", "main")
+        (root / "src").mkdir()
+        (root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / "huge.py").write_text(f"{sentinel} = 1\n" + ("x = 0\n" * 20_000), encoding="utf-8")
+        (root / ".env").write_text("SECRET=should-not-leak\n", encoding="utf-8")
+        if _git_ok():
+            _git(str(root), "add", "-f", "-A")
+            _git(str(root), "commit", "-m", "base")
+            previous = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+            (root / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (root / "huge.py").write_text(f"{sentinel} = 2\n" + ("y = 1\n" * 20_000), encoding="utf-8")
+            _git(str(root), "add", "-f", "-A")
+            _git(str(root), "commit", "-m", "next")
+            current = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+
+        dump = collector.collect(str(root))
+        check("FILE: src/app.py" in dump and "VALUE =" in dump, "included file contents still reach the dump")
+        check("FILE: huge.py" not in dump, "oversized file contents are omitted from the dump")
+        check(sentinel not in dump, "no oversized file content leaks into the dump")
+        check("should-not-leak" not in dump, "excluded secret contents do not leak")
+        check("huge.py — " in dump and "exceeds limit" in dump, "oversized file remains visible with a reason")
+        check("REPOSITORY STRUCTURE" in dump and "huge.py" in dump, "oversized file remains in the repository tree")
+        check("EXCLUDED FILES" in dump, "dump exposes an EXCLUDED FILES metadata list")
+
+        analysis = analyzer.analyze({"dump": dump})
+        unparsed = {row["path"]: row for row in analysis["unparsed"]}
+        check("huge.py" in unparsed, "analyzer still sees the oversized file")
+        check("exceeds limit" in unparsed["huge.py"]["reason"], "analyzer keeps the exclusion reason")
+        check("content" not in unparsed["huge.py"], "analyzer excluded metadata has no file contents")
+        check(sentinel not in json.dumps(analysis), "oversized file content does not reach analyzer JSON")
+        check(any(row["path"] == "src/app.py" for row in analysis["files"]),
+              "included Python is still analyzed")
+
+        mapped = mapper.build({"analysis": analysis})
+        modules = {row["path"]: row for row in mapped["modules"]}
+        check("huge.py" in modules, "repository map still sees the oversized file")
+        check(modules["huge.py"]["status"] == "excluded", "repository map marks the file excluded, not missing")
+        check("exceeds limit" in modules["huge.py"]["reason"], "repository map keeps the exclusion reason")
+        check(sentinel not in json.dumps(mapped), "oversized file content does not reach the repository map")
+
+        if _git_ok():
+            changed = changes.detect_changes(str(root), previous_commit=previous, new_commit=current)
+            by_path = {row["path"]: row for row in changed["changed"]}
+            check(by_path.get("src/app.py", {}).get("status") == "modified",
+                  "/changes still reports eligible modified files")
+            check(by_path.get("huge.py", {}).get("eligible") is False, "/changes still marks oversized files ineligible")
+            check("exceeds limit" in str(by_path.get("huge.py", {}).get("reason") or ""),
+                  "/changes still carries the per-file exclusion reason")
+            check(len(by_path) == 2, "/changes still lists only changed files, not the whole repository")
+            check(sentinel not in json.dumps(changed), "/changes still omits file contents")
+
+
+def _build_origin_with_history(root: Path) -> dict[str, str]:
+    _git(str(root), "init", "-b", "main")
+    (root / "keep.py").write_text("print('v1')\n", encoding="utf-8")
+    (root / "gone.txt").write_text("delete-me\n", encoding="utf-8")
+    (root / "old_name.txt").write_text("rename-me\n", encoding="utf-8")
+    (root / ".env").write_text("SECRET=hidden\n", encoding="utf-8")
+    _git(str(root), "add", "-f", "-A")
+    _git(str(root), "commit", "-m", "base")
+    previous = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+    (root / "keep.py").write_text("print('v2')\n", encoding="utf-8")
+    (root / "added.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(str(root), "rm", "gone.txt")
+    _git(str(root), "mv", "old_name.txt", "new_name.txt")
+    _git(str(root), "add", "-f", "-A")
+    _git(str(root), "commit", "-m", "next")
+    _git(str(root), "branch", "feature")
+    current = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+    return {"previous": previous, "current": current}
+
+
+def test_workspace_reuse_and_shallow() -> None:
+    print("\nworkspace reuse and shallow previous SHA")
+    if not _git_ok():
+        print("  skip  git is not available on PATH")
+        return
+
+    import changes  # noqa: E402
+    import server as collector_server  # noqa: E402
+    import workspace  # noqa: E402
+
+    workspace.reset()
+    url_a = "https://example.test/owner/repo"
+    url_b = "https://example.test/owner/other"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        origin_a = Path(tmp) / "origin-a"
+        origin_b = Path(tmp) / "origin-b"
+        origin_a.mkdir()
+        origin_b.mkdir()
+        shas = _build_origin_with_history(origin_a)
+        _build_origin_with_history(origin_b)
+        (origin_b / "only-b.py").write_text("other = 1\n", encoding="utf-8")
+        _git(str(origin_b), "add", "only-b.py")
+        _git(str(origin_b), "commit", "-m", "other")
+
+        clones: list[tuple[str, str]] = []
+        origins = {url_a: origin_a, url_b: origin_b}
+
+        def fake_is_remote(source: str) -> bool:
+            return source.startswith("https://example.test/")
+
+        def fake_clone(source: str, ref: str, dest: str) -> None:
+            clones.append((source, ref or ""))
+            src = origins[source]
+            dest_path = Path(dest)
+            if dest_path.exists() and not any(dest_path.iterdir()):
+                dest_path.rmdir()
+            extra = ["--branch", ref] if ref and not collector._SHA_RE.match(ref) else []
+            _git(str(dest_path.parent), "clone", "--depth", "1", "--no-local", *extra, str(src), dest)
+
+        original_is_remote = collector.is_remote
+        original_clone = collector.clone_remote
+        original_changes_remote = changes.is_remote
+        collector.is_remote = fake_is_remote
+        collector.clone_remote = fake_clone
+        changes.is_remote = fake_is_remote
+        try:
+            result = changes.detect_changes(
+                url_a,
+                previous_commit=shas["previous"],
+                new_commit=shas["current"],
+            )
+            by_path = {row["path"]: row for row in result["changed"]}
+            check(result["previousCommit"] == shas["previous"], "missing previous SHA was fetched")
+            check(by_path.get("added.py", {}).get("status") == "added", "fetched previous SHA still detects adds")
+            check(by_path.get("keep.py", {}).get("status") == "modified", "fetched previous SHA still detects edits")
+            check(by_path.get("gone.txt", {}).get("status") == "deleted", "fetched previous SHA still detects deletes")
+            check(by_path.get("new_name.txt", {}).get("status") == "renamed",
+                  "fetched previous SHA still detects renames")
+            first_clones = len(clones)
+
+            dump = collector.collect(url_a)
+            check(len(clones) == first_clones, "/changes then /collect reuse one workspace")
+            check("print('v2')" in dump and "FILE: added.py" in dump, "reused workspace still collects current files")
+            check("SECRET=hidden" not in dump and "\nFILE: .env\n" not in dump,
+                  "workspace reuse does not bypass sanitization")
+
+            collector.collect(url_b)
+            check(any(source == url_b for source, _ref in clones),
+                  "a different repository does not reuse the other workspace")
+
+            workspace.reset()
+            clones.clear()
+            collector.collect(url_a, ref="main")
+            collector.collect(url_a, ref="feature")
+            check(len(clones) == 2, "different refs do not share the wrong workspace")
+
+            workspace.reset()
+            clones.clear()
+            errors: list[str] = []
+
+            def collect_one(target: str) -> None:
+                try:
+                    collector.collect(target)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+
+            first = threading.Thread(target=collect_one, args=(url_a,))
+            second = threading.Thread(target=collect_one, args=(url_b,))
+            first.start()
+            second.start()
+            first.join()
+            second.join()
+            check(not errors, "concurrent collections do not fail")
+            check({source for source, _ref in clones} == {url_a, url_b},
+                  "concurrent requests for different repositories stay isolated")
+
+            workspace.reset()
+            clones.clear()
+            collector.collect(url_a)
+            item = next(iter(workspace._workspaces.values()))
+            git_dir = Path(item.path) / ".git"
+            if git_dir.is_dir():
+                for child in git_dir.rglob("*"):
+                    if child.is_file():
+                        child.chmod(0o666)
+                import shutil
+
+                shutil.rmtree(git_dir)
+            clones_before = len(clones)
+            collector.collect(url_a)
+            check(len(clones) > clones_before, "a stale or invalid workspace is not reused")
+
+            workspace.reset()
+            clones.clear()
+            shallow = Path(tmp) / "shallow-local"
+            _git(str(tmp), "clone", "--depth", "1", "--no-local", str(origin_a), str(shallow))
+            has_prev = workspace.has_commit(str(shallow), shas["previous"])
+            check(not has_prev, "depth-1 clone does not contain the previous SHA")
+            already = changes.detect_changes(
+                str(shallow),
+                previous_commit=shas["previous"],
+                new_commit=shas["current"],
+            )
+            check(already["previousCommit"] == shas["previous"],
+                  "previous SHA missing from a shallow local clone is fetched from origin")
+            check(any(row["path"] == "added.py" for row in already["changed"]),
+                  "diff after fetching the previous SHA is correct")
+
+            _git(str(shallow), "fetch", "--depth", "1", "origin", shas["previous"])
+            present = changes.detect_changes(
+                str(shallow),
+                previous_commit=shas["previous"],
+                new_commit=shas["current"],
+            )
+            check(present["changed"] == already["changed"],
+                  "previous SHA already in the shallow clone still diffs correctly")
+
+            orphan = Path(tmp) / "orphan-shallow"
+            _git(str(tmp), "clone", "--depth", "1", "--no-local", str(origin_a), str(orphan))
+            _git(str(orphan), "remote", "remove", "origin")
+            try:
+                changes.detect_changes(
+                    str(orphan),
+                    previous_commit=shas["previous"],
+                    new_commit=shas["current"],
+                )
+                check(False, "unavailable previous SHA fails explicitly")
+            except collector.CollectorError as exc:
+                check(exc.status == 404 and "not found" in str(exc).lower(),
+                      "unavailable previous SHA is a 404")
+
+            workspace.reset()
+            clones.clear()
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), collector_server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = httpd.server_address[1]
+                change_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/changes",
+                    data=json.dumps({
+                        "repository": url_a,
+                        "previousCommit": shas["previous"],
+                        "newCommit": shas["current"],
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(change_req, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                collect_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/collect",
+                    data=json.dumps({"repository": url_a, "ref": shas["current"]}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(collect_req, timeout=30) as response:
+                    body = response.read().decode("utf-8")
+                check(payload["changed"] and "print('v2')" in body,
+                      "HTTP /changes then /collect reuse the same workspace")
+                check(payload["newCommit"] == shas["current"] and f"COMMIT: {shas['current']}" in body,
+                      "HTTP /changes and /collect use the same explicit newCommit")
+                check(len(clones) == 1, "HTTP same-pipeline calls clone the remote once")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            collector.is_remote = original_is_remote
+            collector.clone_remote = original_clone
+            changes.is_remote = original_changes_remote
+            workspace.reset()
+
+
+def test_documentation_registry() -> None:
+    print("\ndocumentation registry")
+    _validation, ark_client, registry = _host_modules()
+
+    sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    sha2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    url = "https://github.com/owner/repo"
+    other = "https://github.com/owner/other"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "documentation-registry.json"
+        html = Path(tmp) / "repo.html"
+        html.write_text(
+            "<!DOCTYPE html><html><body>COMMIT: ffffffffffffffffffffffffffffffffffffffff</body></html>",
+            encoding="utf-8",
+        )
+
+        check(registry.lookup(url, path) is None, "first run has no previous documented SHA")
+        first = ark_client.plan_documentation(
+            url,
+            current_sha=sha1,
+            registry_path=path,
+        )
+        check(first["status"] == "first_run", "no previous SHA is a first documentation run")
+        check(first["mode"] == "full" and first["previousCommit"] == "", "first run has an empty previousCommit")
+        check(first["runPipeline"] is True, "first run still documents the repository")
+        check(first["documentationVersion"] == 0, "first run has no documentation version yet")
+        check(registry.lookup(url, path) is None, "planning a first run does not persist a SHA")
+
+        failed = ark_client.execute_documentation_plan(
+            first,
+            run_pipeline=lambda _plan: {"ok": False, "error": "renderer failed"},
+            registry_path=path,
+        )
+        check(failed["status"] == "failed", "failed documentation is reported as failed")
+        check(registry.lookup(url, path) is None, "failed documentation does not persist a SHA")
+        check(ark_client.documented_commit(url, registry_path=path) == "",
+              "failed first run leaves no documented commit")
+
+        ran = {"count": 0}
+
+        def succeed(_plan: dict) -> dict:
+            ran["count"] += 1
+            return {"ok": True, "artifact": "repo.html"}
+
+        documented = ark_client.execute_documentation_plan(
+            first,
+            run_pipeline=succeed,
+            registry_path=path,
+        )
+        check(documented["status"] == "documented", "successful documentation is reported as documented")
+        check(documented["currentCommit"] == sha1, "successful documentation persists the current SHA")
+        check(documented["documentationVersion"] == 1, "first successful run creates documentation version 1")
+        stored = registry.lookup(url, path)
+        check(stored is not None and stored["commitSha"] == sha1, "registry stores the documented SHA")
+        check(stored["status"] == "documented", "registry marks the repository as documented")
+        check(stored["identity"] == "github.com/owner/repo", "registry stores a stable repository identity")
+        check(path.is_file() and html.read_text(encoding="utf-8").startswith("<!DOCTYPE html>"),
+              "registry is a JSON file, not the generated HTML")
+        check("ffffffffffffffffffffffffffffffffffffffff" not in path.read_text(encoding="utf-8"),
+              "HTML commit text is not used as the documented SHA")
+
+        later = ark_client.plan_documentation(
+            "https://github.com/owner/repo.git",
+            current_sha=sha2,
+            registry_path=path,
+        )
+        check(later["status"] == "needs_documentation", "a new commit needs documentation")
+        check(later["previousCommit"] == sha1, "later run reads the previously stored SHA")
+        check(later["mode"] == "incremental", "stored SHA is the baseline for later incremental detection")
+        check(later["documentationVersion"] == 1, "unreadied new commit does not bump the version")
+        check(ark_client.documented_commit(url, registry_path=path) == sha1,
+              "documented_commit exposes the stored SHA for /changes")
+
+        failed_update = ark_client.execute_documentation_plan(
+            later,
+            run_pipeline=lambda _plan: {"ok": False, "error": "query error"},
+            registry_path=path,
+        )
+        check(failed_update["status"] == "failed", "failed later run is reported as failed")
+        check(ark_client.documented_commit(url, registry_path=path) == sha1,
+              "failed documentation does not advance the stored SHA")
+        check(registry.lookup(url, path)["documentationVersion"] == 1,
+              "failed documentation does not create a new documentation version")
+
+        updated = ark_client.execute_documentation_plan(
+            later,
+            run_pipeline=succeed,
+            registry_path=path,
+        )
+        check(updated["currentCommit"] == sha2, "successful new commit persists the new SHA")
+        check(updated["documentationVersion"] == 2, "a genuinely new commit increments the documentation version")
+
+        same = ark_client.plan_documentation(
+            url,
+            current_sha=sha2,
+            registry_path=path,
+        )
+        check(same["status"] == "already_documented", "same repository + same SHA is already_documented")
+        check(same["runPipeline"] is False, "already_documented skips documentation regeneration")
+        check(same["documentationVersion"] == 2, "already_documented keeps the existing documentation version")
+        check(same["currentCommit"] == sha2 and same["previousCommit"] == sha2,
+              "already_documented does not advance the stored SHA")
+
+        skipped = ark_client.execute_documentation_plan(
+            same,
+            run_pipeline=succeed,
+            registry_path=path,
+        )
+        check(skipped["status"] == "already_documented", "execute returns already_documented without running")
+        check(ran["count"] == 2, "same SHA does not invoke documentation generation")
+        check(registry.lookup(url, path)["documentationVersion"] == 2,
+              "same SHA does not create a new documentation version")
+        check(registry.lookup(url, path)["commitSha"] == sha2,
+              "same SHA leaves the stored SHA unchanged")
+
+        other_plan = ark_client.plan_documentation(other, current_sha=sha1, registry_path=path)
+        check(other_plan["status"] == "first_run", "a different repository has its own documented SHA")
+
+        check("session_state" not in Path(registry.__file__).read_text(encoding="utf-8"),
+              "registry module does not depend on Streamlit session state")
+
+        prefix_plan = ark_client.plan_documentation(
+            url,
+            current_sha=sha2[:7],
+            registry_path=path,
+        )
+        check(
+            prefix_plan["status"] != "already_documented",
+            "a SHA prefix of the documented commit is not already_documented",
+        )
+        other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc"
+        different = ark_client.plan_documentation(url, current_sha=other_sha, registry_path=path)
+        check(different["status"] == "needs_documentation",
+              "a different full SHA is not treated as the documented commit")
+
+
+def test_commit_pinning_and_eligibility() -> None:
+    print("\ncommit pinning, SHA equality, and eligibility flips")
+    _validation, ark_client, registry = _host_modules()
+
+    previous_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    new_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    query = ark_client.build_input(
+        "https://github.com/a/b",
+        "main",
+        previous_commit=previous_sha,
+        new_commit=new_sha,
+    )
+    check(
+        query == (
+            "Document this repository: https://github.com/a/b ref: main "
+            f"previousCommit: {previous_sha} newCommit: {new_sha}"
+        ),
+        "registry previousCommit and newCommit reach the Query",
+    )
+    check(
+        ark_client.build_input("https://github.com/a/b")
+        == "Document this repository: https://github.com/a/b",
+        "first/full Query keeps the V1.3.0 sentence without SHA fields",
+    )
+    with tempfile.TemporaryDirectory() as plan_tmp:
+        empty_registry = Path(plan_tmp) / "empty-registry.json"
+        first_plan = ark_client.plan_documentation(
+            "https://github.com/owner/repo",
+            current_sha=new_sha,
+            registry_path=empty_registry,
+        )
+        first_query = ark_client.build_input(
+            first_plan["repository"],
+            previous_commit=first_plan["previousCommit"],
+            new_commit=first_plan["currentCommit"],
+        )
+        check(first_plan["status"] == "first_run" and first_plan["previousCommit"] == "",
+              "first run still has no previousCommit")
+        check("previousCommit:" not in first_query, "first run Query omits previousCommit")
+        check(f"newCommit: {new_sha}" in first_query, "first run Query still pins newCommit when resolved")
+
+    peeled = ark_client.parse_ls_remote(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.0\n"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.0.0^{}\n"
+    )
+    check(peeled == new_sha, "annotated tag resolution uses the peeled commit SHA")
+    lightweight = ark_client.parse_ls_remote(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main\n"
+    )
+    check(lightweight == previous_sha, "non-tag ls-remote uses the commit SHA")
+
+    check(registry.same_commit(new_sha, new_sha), "identical full SHAs compare equal")
+    check(not registry.same_commit(new_sha, new_sha[:7]), "a 7-character SHA prefix is not full equality")
+    check(not registry.same_commit(previous_sha, new_sha), "different commits are not equal")
+    check(
+        not registry.same_commit(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            previous_sha,
+        ),
+        "near-matching full SHAs are not equal",
+    )
+
+    ui_src = (ROOT / "app" / "ui.py").read_text(encoding="utf-8")
+    check('previous_commit=plan.get("previousCommit")' in ui_src,
+          "Streamlit forwards the registry previousCommit into Query input")
+    check('new_commit=plan.get("currentCommit")' in ui_src,
+          "Streamlit forwards the pinned newCommit into Query input")
+
+    if not _git_ok():
+        print("  skip  git-backed pinning tests (git is not available)")
+        return
+
+    import changes  # noqa: E402
+    import workspace  # noqa: E402
+
+    workspace.reset()
+    url = "https://example.test/owner/pinned"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        origin = Path(tmp) / "origin"
+        origin.mkdir()
+        _git(str(origin), "init", "-b", "main")
+        (origin / "keep.py").write_text("print('v1')\n", encoding="utf-8")
+        (origin / "grow.py").write_text("OLD_ELIGIBLE_BODY = 1\n" + ("x" * 70_000), encoding="utf-8")
+        (origin / "shrink.py").write_text("OLD_EXCLUDED_BODY = 1\n" + ("y" * 90_000), encoding="utf-8")
+        (origin / "aaa.py").write_text("a=1\n", encoding="utf-8")
+        (origin / "zzz_budget.py").write_text("PREVIOUS_BUDGET_BODY = 1\n", encoding="utf-8")
+        (origin / "gone.txt").write_text("delete-me\n", encoding="utf-8")
+        (origin / "old_name.txt").write_text("rename-me\n", encoding="utf-8")
+        _git(str(origin), "add", "-A")
+        _git(str(origin), "commit", "-m", "base")
+        previous = _git(str(origin), "rev-parse", "HEAD").stdout.strip()
+
+        (origin / "keep.py").write_text("print('v2')\n", encoding="utf-8")
+        (origin / "added.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (origin / "grow.py").write_text("NEW_OVERSIZE_BODY = 1\n" + ("z" * 90_000), encoding="utf-8")
+        (origin / "shrink.py").write_text("NEW_ELIGIBLE_BODY = 1\n", encoding="utf-8")
+        (origin / "zzz_budget.py").write_text("CURRENT_BUDGET_BODY = 1\n", encoding="utf-8")
+        _git(str(origin), "rm", "gone.txt")
+        _git(str(origin), "mv", "old_name.txt", "new_name.txt")
+        _git(str(origin), "add", "-A")
+        _git(str(origin), "commit", "-m", "next")
+        current = _git(str(origin), "rev-parse", "HEAD").stdout.strip()
+
+        old_entries = collector.collect_into(str(origin), ref=previous).entries
+        new_entries = collector.collect_into(str(origin), ref=current).entries
+        old_bodies = {entry.path: entry.text for entry in old_entries if entry.included}
+        new_state = collector.current_commit_bodies(new_entries)
+        new_by_path = {entry.path: entry for entry in new_entries}
+
+        check(old_bodies.get("grow.py", "").startswith("OLD_ELIGIBLE_BODY"),
+              "70 KB file is collectable in the previous commit")
+        check(not new_by_path["grow.py"].included and new_state["grow.py"] == "",
+              "90 KB file is excluded in the current commit")
+        check("OLD_ELIGIBLE_BODY" not in new_state["grow.py"],
+              "growing past 80 KB does not retain the old body as current content")
+        current_dump = collector.collect(str(origin), ref=current)
+        check("NEW_OVERSIZE_BODY" not in current_dump and "OLD_ELIGIBLE_BODY" not in current_dump,
+              "excluded oversize contents are not sent to the dump/LLM")
+        check("EXCLUDED FILES" in current_dump and "grow.py — " in current_dump,
+              "current dump lists the newly ineligible file as excluded metadata")
+        check("OLD_EXCLUDED_BODY" not in old_bodies.get("shrink.py", ""),
+              "90 KB file has no previous body")
+        check(new_state.get("shrink.py", "").startswith("NEW_ELIGIBLE_BODY"),
+              "shrinking under 80 KB uses the current collectable body")
+        check("OLD_EXCLUDED_BODY" not in new_state.get("shrink.py", ""),
+              "newly collectable file does not keep an old excluded sentinel")
+
+        tiny = collector.collect_into(str(origin), ref=current, max_total_bytes=10)
+        tiny_state = collector.current_commit_bodies(tiny.entries)
+        omitted = [entry for entry in tiny.entries if "budget" in entry.reason]
+        check(bool(omitted), "total-budget omission is excluded metadata, not a silent keep")
+        check(all(tiny_state[entry.path] == "" for entry in omitted),
+              "budget-omitted files have no current body")
+        check(all(old_bodies.get(entry.path, "") != tiny_state[entry.path] or not old_bodies.get(entry.path)
+                  for entry in omitted if entry.path in old_bodies),
+              "budget exclusion does not leave stale previous content")
+        tiny_dump = collector.render(tiny)
+        check("PREVIOUS_BUDGET_BODY" not in tiny_dump, "previous budgeted body is not current dump content")
+        check("zzz_budget.py — " in tiny_dump and "EXCLUDED FILES" in tiny_dump,
+              "budget-omitted file is listed as excluded metadata")
+
+        changed = changes.detect_changes(str(origin), previous_commit=previous, new_commit=current)
+        by_path = {row["path"]: row for row in changed["changed"]}
+        check(changed["newCommit"] == current, "/changes reports the pinned newCommit")
+        check(by_path.get("added.py", {}).get("status") == "added", "add remains reported")
+        check(by_path.get("keep.py", {}).get("status") == "modified", "modify remains reported")
+        check(by_path.get("gone.txt", {}).get("status") == "deleted", "delete remains reported")
+        check(by_path.get("new_name.txt", {}).get("status") == "renamed", "rename remains reported")
+        check(by_path.get("grow.py", {}).get("eligible") is False, "/changes marks the 80 KB grow as ineligible")
+        check(by_path.get("shrink.py", {}).get("eligible") is True, "/changes marks the 80 KB shrink as eligible")
+        check("max_total_bytes" not in Path(changes.__file__).read_text(encoding="utf-8"),
+              "/changes is still not a collection-budget filter")
+        check("NEW_OVERSIZE_BODY" not in json.dumps(changed),
+              "/changes does not send excluded file contents")
+
+        clones: list[tuple[str, str]] = []
+
+        def fake_is_remote(source: str) -> bool:
+            return source.startswith("https://example.test/")
+
+        def fake_clone(source: str, ref: str, dest: str) -> None:
+            clones.append((source, ref or ""))
+            dest_path = Path(dest)
+            if dest_path.exists() and not any(dest_path.iterdir()):
+                dest_path.rmdir()
+            extra = ["--branch", ref] if ref and not collector._SHA_RE.match(ref) else []
+            _git(str(dest_path.parent), "clone", "--depth", "1", "--no-local", *extra, str(origin), dest)
+
+        original_is_remote = collector.is_remote
+        original_clone = collector.clone_remote
+        original_changes_remote = changes.is_remote
+        collector.is_remote = fake_is_remote
+        collector.clone_remote = fake_clone
+        changes.is_remote = fake_is_remote
+        try:
+            detected = changes.detect_changes(
+                url,
+                previous_commit=previous,
+                new_commit=current,
+            )
+            collection = collector.collect_into(url, ref=current)
+            dump = collector.render(collection)
+            check(detected["newCommit"] == current, "/changes uses the explicit newCommit")
+            check(collection.commit == current, "/collect persists the checked-out SHA")
+            check(f"COMMIT: {current}" in dump, "collection dump is pinned to the requested SHA")
+            check(detected["newCommit"] == collection.commit,
+                  "/changes and /collect use the same exact newCommit")
+            check("print('v2')" in dump and "FILE: added.py" in dump,
+                  "collection at the pinned SHA includes that commit's tree")
+            check("print('v1')" not in dump, "collection at newCommit does not use the previous tree")
+
+            item = next(iter(workspace._workspaces.values()))
+            _git(item.path, "checkout", "--force", "--detach", previous)
+            check(workspace._head(item.path) == previous, "workspace HEAD can be moved off newCommit")
+            clones_before = len(clones)
+            recovered = collector.collect_into(url, ref=current)
+            check(recovered.commit == current, "wrong-HEAD workspace is not reused as-is")
+            check(f"COMMIT: {current}" in collector.render(recovered),
+                  "collect after a wrong HEAD still pins the requested SHA")
+            check("print('v2')" in collector.render(recovered),
+                  "recovered collection uses the requested commit tree")
+            check(len(clones) >= clones_before,
+                  "a workspace whose HEAD does not match newCommit is discarded or realigned")
+        finally:
+            collector.is_remote = original_is_remote
+            collector.clone_remote = original_clone
+            changes.is_remote = original_changes_remote
+            workspace.reset()
 
 
 def test_git_errors() -> None:
@@ -1858,8 +2882,31 @@ def test_pipeline_config() -> None:
     )
     check("repository-analyzer" not in tools_block, "pipeline Agent does not call the analyzer")
     check("repository-map" not in tools_block, "pipeline Agent does not call the repository map")
-    check("Do not call repository-collector, repository-analyzer, or repository-map" in pipeline,
-          "pipeline prompt keeps collection, analysis, and mapping off the orchestrator")
+    check("repository-changes" not in tools_block, "pipeline Agent does not call change detection")
+    check("Do not call repository-collector, repository-analyzer, repository-map, or" in pipeline
+          and "repository-changes" in pipeline,
+          "pipeline prompt keeps collection, analysis, mapping, and changes off the orchestrator")
+    changes_tool = (ROOT / "tools" / "repository-changes.yaml").read_text(encoding="utf-8")
+    check("/changes" in changes_tool and "type: http" in changes_tool, "changes Tool posts to /changes")
+    changes_src = (ROOT / "tools" / "repository-collector" / "changes.py").read_text(encoding="utf-8")
+    check("is_collectable_path" in changes_src, "change detection reuses collector path inclusion rules")
+    check("max_total_bytes" not in changes_src and "DEFAULT_MAX_TOTAL_BYTES" not in changes_src,
+          "change detection does not apply the total collection budget")
+    check('"209715200"' in collector_tool, "collector Tool default total budget is 200 MiB")
+    check("DEFAULT_MAX_TOTAL_BYTES = 200 * 1024 * 1024" in collector_src,
+          "collector default total budget is 200 MiB")
+    check("open_remote" in collector_src, "collect reuses the same-pipeline workspace")
+    analyzer_src = (ROOT / "tools" / "repository-analyzer" / "analyzer.py").read_text(encoding="utf-8")
+    check("excluded_from_dump" in analyzer_src, "analyzer reads excluded-file metadata from the dump")
+    check("Excluded files and unwalked directories are unseen" not in docs,
+          "documentation Agent does not treat excluded files as missing")
+    check("ensure_commit" in changes_src, "change detection fetches a missing previous SHA")
+    check((ROOT / "tools" / "repository-collector" / "workspace.py").is_file(),
+          "collector workspace helper exists")
+    check(
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-changes", docs) is not None,
+        "documentation Agent references repository-changes",
+    )
     check("repository-analyzer" in values, "Helm values configure the analyzer")
     check("component: analyzer" in (ROOT / "templates" / "repository-analyzer.yaml").read_text(encoding="utf-8"),
           "analyzer Deployment/Service template exists")
@@ -1875,6 +2922,33 @@ def test_pipeline_config() -> None:
     check("repository-map" in values, "Helm values configure the repository map")
     check("component: mapper" in (ROOT / "templates" / "repository-map.yaml").read_text(encoding="utf-8"),
           "map Deployment/Service template exists")
+    registry_src = (ROOT / "app" / "documentation_registry.py").read_text(encoding="utf-8")
+    check("documentation-registry.json" in registry_src, "documented SHA is stored in a JSON registry")
+    check("read_text" not in registry_src or "out/" not in registry_src,
+          "registry does not treat generated HTML as the source of truth")
+    check("session_state" not in registry_src and "session_state" not in ark_client_src,
+          "documented SHA is not stored only in Streamlit memory")
+    check("already_documented" in ark_client_src, "ark_client returns already_documented for the same SHA")
+    check("plan_documentation" in ui_src and "execute_documentation_plan" in ui_src,
+          "Streamlit consults the registry before applying a Query")
+    check("previousCommit" in pipeline and "newCommit" in pipeline,
+          "pipeline Agent forwards supplied previousCommit and newCommit")
+    check("Do not invent, infer, or look up commit SHAs" in pipeline,
+          "pipeline Agent does not invent commit SHAs")
+    check("previousCommit" in docs and "newCommit" in docs,
+          "documentation Agent consumes Query previousCommit and newCommit")
+    check("pass that exact SHA as" in docs and "collector `ref`" in docs,
+          "documentation Agent pins collector ref to newCommit")
+    check("parse_ls_remote" in ark_client_src, "ls-remote prefers the peeled annotated-tag commit")
+    check("current_commit_bodies" in collector_src,
+          "collector exposes current-commit bodies without stale excluded content")
+    check("checkout_commit" in (ROOT / "tools" / "repository-collector" / "workspace.py").read_text(
+        encoding="utf-8"
+    ), "workspace checks out the requested newCommit")
+    check("tag: m12" in values, "collector image tag is m12")
+    check("tag: m2" in values, "analyzer and map image tags remain m2")
+    check("state/" in (ROOT / ".gitignore").read_text(encoding="utf-8"),
+          "documentation registry directory is gitignored")
 
 
 def renderer_artifact(filename: str) -> str | None:
@@ -1984,6 +3058,13 @@ def main() -> int:
     test_local_llm_detector()
     test_input_validation()
     test_ref_handling()
+    test_git_change_detection()
+    test_change_filtering()
+    test_change_eligibility_and_budget()
+    test_excluded_file_visibility()
+    test_workspace_reuse_and_shallow()
+    test_documentation_registry()
+    test_commit_pinning_and_eligibility()
     test_git_errors()
     test_gitlab_auth_abstraction()
     test_renderer_unit()

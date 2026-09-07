@@ -14,6 +14,7 @@ from languages import ANALYZERS, PYTHON, language_for
 
 SCHEMA_VERSION = "1"
 FILE_BANNER = re.compile(r"^={50}\nFILE: ([^\n]+)\n={50}\n?", re.MULTILINE)
+EXCLUDED_HEADER = re.compile(r"^EXCLUDED FILES\n-+\n+", re.MULTILINE)
 
 
 class AnalyzerError(ValueError):
@@ -37,6 +38,31 @@ def files_from_dump(dump: str) -> list[dict[str, str]]:
             }
         )
     return files
+
+
+def excluded_from_dump(dump: str) -> list[dict[str, str]]:
+    """Read path/reason rows from the dump EXCLUDED FILES list. Never contents."""
+    header = EXCLUDED_HEADER.search(dump or "")
+    if not header:
+        return []
+    rest = dump[header.end() :]
+    nxt = FILE_BANNER.search(rest)
+    block = rest[: nxt.start()] if nxt else rest
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or " — " not in line:
+            continue
+        path_text, reason = line.rsplit(" — ", 1)
+        path = normalize_path(path_text)
+        reason = reason.strip()
+        if not path or not reason or path in seen:
+            continue
+        seen.add(path)
+        rows.append({"path": path, "reason": reason})
+    rows.sort(key=lambda row: row["path"])
+    return rows
 
 
 def normalize_request(payload: Any) -> list[dict[str, str]]:
@@ -68,7 +94,7 @@ def normalize_request(payload: Any) -> list[dict[str, str]]:
     dump = payload.get("dump")
     if isinstance(dump, str) and dump.strip():
         files = files_from_dump(dump)
-        if files:
+        if files or excluded_from_dump(dump):
             return files
         raise AnalyzerError("dump contained no FILE sections")
 
@@ -107,4 +133,12 @@ def analyze_files(files: list[dict[str, str]]) -> dict[str, Any]:
 
 
 def analyze(payload: Any) -> dict[str, Any]:
-    return analyze_files(normalize_request(payload))
+    excluded = excluded_from_dump(payload.get("dump") or "") if isinstance(payload, dict) else []
+    result = analyze_files(normalize_request(payload))
+    seen = {row["path"] for row in result["files"]}
+    seen.update(row["path"] for row in result["unparsed"])
+    extra = [row for row in excluded if row["path"] not in seen]
+    if extra:
+        result["unparsed"].extend(extra)
+        result["unparsed"].sort(key=lambda row: row["path"])
+    return result

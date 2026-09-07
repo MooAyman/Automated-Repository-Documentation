@@ -87,6 +87,18 @@ def validate_repository_url(repository_url: str) -> str:
     return urlunsplit((scheme, _netloc(parts), rebuilt_path, "", ""))
 
 
+def validate_commit_sha(value: str, *, required: bool = False) -> str:
+    """Validate an optional documented commit SHA. Does not check existence."""
+    text = (value or "").strip()
+    if not text:
+        if required:
+            raise ValidationError("commit SHA is required")
+        return ""
+    if not _SHA_RE.match(text):
+        raise ValidationError("commit SHA is invalid")
+    return text
+
+
 def validate_ref(ref: str) -> str:
     """Validate optional git ref syntax. Does not check that the ref exists."""
     value = (ref or "").strip()
