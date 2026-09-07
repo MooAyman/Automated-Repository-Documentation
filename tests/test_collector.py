@@ -5,19 +5,26 @@ Add the live clone test:          python tests/test_collector.py --network
 Add the deployed end-to-end test:  python tests/test_collector.py --e2e
 
 The --e2e mode exercises the deployed repository-pipeline flow and verifies
-that documentation is generated successfully.
+that documentation is generated successfully. Security verification covers
+the sanitized dump, the HTTP /collect tool payload, and collector logs.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "repository-collector"))
@@ -221,6 +228,696 @@ def test_urls_and_invalid_input() -> None:
         check(False, "URL with empty path raises CollectorError")
     except collector.CollectorError as exc:
         check("Invalid repository URL" in str(exc), "empty GitLab path is an invalid URL")
+
+
+def _fake_secrets() -> dict[str, str]:
+    """Runtime-only fixtures so complete secret strings are not stored in Git."""
+    jwt = ".".join(
+        (
+            __import__("base64").urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode("ascii").rstrip("="),
+            __import__("base64").urlsafe_b64encode(b'{"sub":"redaction-fixture"}').decode("ascii").rstrip("="),
+            "sig" + ("C" * 24),
+        )
+    )
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + ("MIIEowFake" * 8)
+        + "\n-----END RSA PRIVATE KEY-----"
+    )
+    return {
+        "private-key": pem,
+        "jwt": jwt,
+        "aws": "AKIA" + "IOSFODNN7EXAMPLE",
+        "github": "ghp_" + ("A" * 36),
+        "gitlab": "glpat-" + ("B" * 20),
+        "google": "AIza" + ("C" * 35),
+        "slack": "xoxb-" + ("1" * 12) + "-" + ("D" * 24),
+        "stripe": "sk_test_" + ("E" * 24),
+        "openai": "sk-" + ("F" * 48),
+        "bearer": "Bearer " + ("G" * 32),
+        "password-url": "https://oauth2:" + ("H" * 16) + "@gitlab.example.com/g/p.git",
+        "email": "qa.redaction@" + "example.com",
+        "phone": "+1-202-555-0181",
+        "card": "4111-1111-1111-1111",
+        "ssn": "078-05-1120",
+    }
+
+
+def test_dump_sanitization() -> None:
+    print("\ndump sanitization")
+    import sanitizer  # noqa: E402
+
+    secrets = _fake_secrets()
+    src = (ROOT / "tools" / "repository-collector" / "sanitizer.py").read_text(encoding="utf-8")
+    check("import logging" not in src and "print(" not in src, "sanitizer does not log or print matches")
+
+    sample = "\n".join(
+        [
+            "print('hello')",
+            f"AWS_KEY={secrets['aws']}",
+            f"GITHUB={secrets['github']}",
+            f"GITLAB={secrets['gitlab']}",
+            f"GOOGLE={secrets['google']}",
+            f"SLACK={secrets['slack']}",
+            f"STRIPE={secrets['stripe']}",
+            f"OPENAI={secrets['openai']}",
+            f"AUTH={secrets['bearer']}",
+            f"CLONE={secrets['password-url']}",
+            f"CONTACT={secrets['email']}",
+            f"PHONE={secrets['phone']}",
+            f"CARD={secrets['card']}",
+            f"SSN={secrets['ssn']}",
+            f"TOKEN={secrets['jwt']}",
+            secrets["private-key"],
+            "remote = git@github.com:org/demo.git",
+            "id 1234567890123",
+        ]
+    )
+    first = sanitizer.sanitize(sample)
+    second = sanitizer.sanitize(sample)
+    check(first == second, "sanitizer is deterministic")
+    check("print('hello')" in first, "non-sensitive source is kept")
+    check("git@github.com:org/demo.git" in first, "git SCP remotes are not treated as emails")
+    check("1234567890123" in first, "non-card digit strings are kept")
+
+    for kind, value in secrets.items():
+        if kind == "password-url":
+            secret_part = ("H" * 16)
+            check(secret_part not in first, f"{kind} original value is not in the sanitized text")
+        elif kind == "bearer":
+            check(("G" * 32) not in first, "bearer token original value is not in the sanitized text")
+        else:
+            check(value not in first, f"{kind} original value is not in the sanitized text")
+
+    for marker in (
+        sanitizer.REDACTED["aws-access-key"],
+        sanitizer.REDACTED["github-pat"],
+        sanitizer.REDACTED["gitlab-pat"],
+        sanitizer.REDACTED["google-api-key"],
+        sanitizer.REDACTED["slack-token"],
+        sanitizer.REDACTED["stripe-key"],
+        sanitizer.REDACTED["openai-key"],
+        sanitizer.REDACTED["bearer-token"],
+        sanitizer.REDACTED["password"],
+        sanitizer.REDACTED["email"],
+        sanitizer.REDACTED["phone"],
+        sanitizer.REDACTED["card"],
+        sanitizer.REDACTED["ssn"],
+        sanitizer.REDACTED["jwt"],
+        sanitizer.REDACTED["private-key"],
+    ):
+        check(marker in first, f"placeholder {marker} is present")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "leaky-repo"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "config.py").write_text(sample, encoding="utf-8")
+        (root / ".env").write_text("SECRET=supersecret\n", encoding="utf-8")
+        (root / "secrets.yaml").write_text("password: supersecret\n", encoding="utf-8")
+
+        entries = collector.scan(str(root), max_file_bytes=80_000, max_total_bytes=250_000)
+        included = {e.path for e in entries if e.included}
+        skipped = {e.path for e in entries if not e.included}
+        check("src/config.py" in included, "content scanner does not replace filename filtering")
+        check(".env" in skipped, "`.env` is still excluded by filename")
+        check("secrets.yaml" in skipped, "`secrets.yaml` is still excluded by filename")
+
+        raw_entry = next(e for e in entries if e.path == "src/config.py")
+        check(secrets["email"] in raw_entry.text, "scan() still holds file text before dump sanitization")
+
+        dump = collector.collect(str(root))
+        check("FILE: src/config.py" in dump, "sensitive file is still listed in the dump")
+        check("supersecret" not in dump, "filename-filtered secret contents never reach the dump")
+        for kind, value in secrets.items():
+            if kind == "password-url":
+                check(("H" * 16) not in dump, f"{kind} original value cannot appear in the dump")
+            elif kind == "bearer":
+                check(("G" * 32) not in dump, "bearer original value cannot appear in the dump")
+            else:
+                check(value not in dump, f"{kind} original value cannot appear in the dump")
+        again = collector.collect(str(root))
+        check(dump == again, "sanitized dump remains deterministic")
+
+
+def test_structured_sanitization() -> None:
+    print("\nstructured sanitization")
+    import structured  # noqa: E402
+
+    src = (ROOT / "tools" / "repository-collector" / "structured.py").read_text(encoding="utf-8")
+    check("import logging" not in src and "print(" not in src, "structured sanitizer does not log or print matches")
+
+    check(structured.is_sensitive_key("password"), "password is a sensitive key")
+    check(structured.is_sensitive_key("api_key"), "api_key is a sensitive key")
+    check(structured.is_sensitive_key("apiKey"), "apiKey is a sensitive key")
+    check(structured.is_sensitive_key("customer_email"), "customer_email is a sensitive key")
+    check(structured.is_sensitive_key("account_number"), "account_number is a sensitive key")
+    check(not structured.is_sensitive_key("host"), "host is not a sensitive key")
+    check(not structured.is_sensitive_key("public_key"), "public_key is not treated as private_key")
+
+    json_password = "plain-json-password-value"
+    json_apikey = "plain-json-apikey-value"
+    json_email_field = "desk-user-local"
+    yaml_token = "plain-yaml-token-value"
+    yaml_access = "plain-yaml-access-key-value"
+    yaml_phone = "ext-4242"
+    yaml_block = "plain-yaml-private-block-value"
+    public_host = "keep-public-hostname"
+    public_name = "Keep Display Name"
+
+    json_text = (
+        "{\n"
+        f'  "password": "{json_password}",\n'
+        f'  "apiKey": "{json_apikey}",\n'
+        f'  "user": {{"customer_email": "{json_email_field}", "name": "{public_name}"}},\n'
+        '  "items": [{"token": "plain-json-array-token", "id": 7}]\n'
+        "}\n"
+    )
+    yaml_text = (
+        f"token: {yaml_token}\n"
+        f"access_key: {yaml_access}\n"
+        f"phone: {yaml_phone}\n"
+        f"host: {public_host}\n"
+        "database:\n"
+        "  password: plain-yaml-nested-password\n"
+        "  name: appdb\n"
+        "services:\n"
+        "  - passwd: plain-yaml-list-passwd\n"
+        "private_key: |\n"
+        f"  {yaml_block}\n"
+        "  still-block-secret\n"
+        "inline: {secret: plain-yaml-flow-secret, host: inline-host}\n"
+    )
+
+    json_out = structured.sanitize_structured("config.json", json_text)
+    yaml_out = structured.sanitize_structured("values.yaml", yaml_text)
+    check(json_out == structured.sanitize_structured("config.json", json_text), "JSON sanitizer is deterministic")
+    check(yaml_out == structured.sanitize_structured("values.yaml", yaml_text), "YAML sanitizer is deterministic")
+
+    for original in (
+        json_password,
+        json_apikey,
+        json_email_field,
+        "plain-json-array-token",
+    ):
+        check(original not in json_out, "JSON original sensitive value is redacted")
+    check(public_name in json_out, "non-sensitive JSON values are kept")
+    check('"password"' in json_out and '"apiKey"' in json_out, "JSON keys are preserved")
+    check(structured.FIELD_PLACEHOLDER in json_out, "JSON uses the field placeholder")
+
+    for original in (
+        yaml_token,
+        yaml_access,
+        yaml_phone,
+        "plain-yaml-nested-password",
+        "plain-yaml-list-passwd",
+        yaml_block,
+        "still-block-secret",
+        "plain-yaml-flow-secret",
+    ):
+        check(original not in yaml_out, "YAML original sensitive value is redacted")
+    check(public_host in yaml_out and "appdb" in yaml_out, "non-sensitive YAML values are kept")
+    check("inline-host" in yaml_out, "non-sensitive YAML flow values are kept")
+    check("token:" in yaml_out and "access_key:" in yaml_out, "YAML keys are preserved")
+    check("print('hello')" == structured.sanitize_structured("src/app.py", "print('hello')"),
+          "non JSON/YAML files are unchanged by structured sanitizer")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "structured-repo"
+        (root / "src").mkdir(parents=True)
+        (root / "config.json").write_text(json_text, encoding="utf-8")
+        (root / "deploy.yml").write_text(yaml_text, encoding="utf-8")
+        (root / "src" / "app.py").write_text("print('hello')\nHOST = 'keep-public-hostname'\n", encoding="utf-8")
+        (root / ".env").write_text("SECRET=supersecret\n", encoding="utf-8")
+
+        dump = collector.collect(str(root))
+        check("FILE: config.json" in dump and "FILE: deploy.yml" in dump, "structured files remain in the dump")
+        check("print('hello')" in dump, "non-structured source is kept")
+        check("supersecret" not in dump, "filename filtering still drops `.env`")
+        for original in (
+            json_password,
+            json_apikey,
+            json_email_field,
+            "plain-json-array-token",
+            yaml_token,
+            yaml_access,
+            yaml_phone,
+            "plain-yaml-nested-password",
+            "plain-yaml-list-passwd",
+            yaml_block,
+            "still-block-secret",
+            "plain-yaml-flow-secret",
+        ):
+            check(original not in dump, "original structured secret cannot appear in the dump")
+        check(public_name in dump and public_host in dump, "non-sensitive structured values reach the dump")
+        check(dump == collector.collect(str(root)), "structured dump remains deterministic")
+
+
+def _assert_absent(haystack: str, values: dict[str, str], label: str) -> None:
+    for name, value in values.items():
+        check(value not in haystack, f"{label}: {name} original value is absent")
+
+
+def test_security_verification() -> None:
+    print("\nsecurity verification")
+    import server as collector_server  # noqa: E402
+    import sanitizer  # noqa: E402
+    import structured  # noqa: E402
+
+    secrets = _fake_secrets()
+    regex_values = {
+        "aws": secrets["aws"],
+        "github": secrets["github"],
+        "gitlab": secrets["gitlab"],
+        "google": secrets["google"],
+        "slack": secrets["slack"],
+        "stripe": secrets["stripe"],
+        "openai": secrets["openai"],
+        "jwt": secrets["jwt"],
+        "private-key": secrets["private-key"],
+        "email": secrets["email"],
+        "phone": secrets["phone"],
+        "card": secrets["card"],
+        "ssn": secrets["ssn"],
+        "url-password": "H" * 16,
+        "bearer": "G" * 32,
+    }
+    structured_values = {
+        "json-password": "plain-json-password-value",
+        "json-apikey": "plain-json-apikey-value",
+        "json-token": "plain-json-customer-token",
+        "json-account": "acct-field-only-999",
+        "yaml-password": "plain-yaml-password-value",
+        "yaml-api-key": "plain-yaml-apikey-value",
+        "yaml-card-field": "card-field-only-4242",
+    }
+    pii_values = {
+        "customer-email": secrets["email"],
+        "customer-phone": secrets["phone"],
+        "customer-card": secrets["card"],
+        "customer-ssn": secrets["ssn"],
+    }
+    excluded_values = {
+        ".env": "EXCL_ENV_ZX9Q_LEAK",
+        ".env.production": "EXCL_ENVPROD_ZX9Q_LEAK",
+        "secrets.yaml": "EXCL_SECRETS_YAML_ZX9Q_LEAK",
+        "credentials.json": "EXCL_CREDS_JSON_ZX9Q_LEAK",
+        "id_rsa": "EXCL_ID_RSA_ZX9Q_LEAK",
+        "tls.pem": "EXCL_TLS_PEM_ZX9Q_LEAK",
+        "app.key": "EXCL_APP_KEY_ZX9Q_LEAK",
+        "service-account.json": "EXCL_SA_JSON_ZX9Q_LEAK",
+        ".git-credentials": "EXCL_GITCRED_ZX9Q_LEAK",
+    }
+    forbidden = {**regex_values, **structured_values, **pii_values, **excluded_values}
+
+    render_src = inspect.getsource(collector.render)
+    collect_src = inspect.getsource(collector.collect)
+    server_src = (ROOT / "tools" / "repository-collector" / "server.py").read_text(encoding="utf-8")
+    docs = (ROOT / "agents" / "repository-documentation.yaml").read_text(encoding="utf-8")
+    check(
+        render_src.find("sanitize_structured") < render_src.find("dump = sanitize("),
+        "structured redaction runs before regex sanitization in render()",
+    )
+    check("dump = sanitize(" in render_src, "render() regex-sanitizes dump text")
+    check(
+        render_src.find("dump = sanitize(") < render_src.find("apply_local_llm_detections"),
+        "optional Local LLM runs only after deterministic sanitization",
+    )
+    check("return apply_local_llm_detections(dump)" in render_src, "render() returns the post-sanitization dump")
+    check("return render(collect_into(" in collect_src, "collect() output is the sanitized dump")
+    check("dump = render(collection)" in server_src, "HTTP /collect payload is render() output")
+    check("self._respond(200, dump)" in server_src, "HTTP /collect returns the sanitized dump body")
+    check("entry.text" not in server_src, "HTTP handler does not send unsanitized file bodies")
+    tools_block = docs.split("prompt:", 1)[0]
+    check(
+        tools_block.count("type: http") == 1 and "repository-collector" in tools_block,
+        "Documentation Agent receives repository content only via repository-collector",
+    )
+    check("documentation-renderer" not in tools_block, "Documentation Agent does not receive renderer payloads")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "security-repo"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "leaks.py").write_text(
+            "\n".join(
+                [
+                    "print('safe-source')",
+                    f"AWS_KEY={secrets['aws']}",
+                    f"GITHUB={secrets['github']}",
+                    f"GITLAB={secrets['gitlab']}",
+                    f"GOOGLE={secrets['google']}",
+                    f"SLACK={secrets['slack']}",
+                    f"STRIPE={secrets['stripe']}",
+                    f"OPENAI={secrets['openai']}",
+                    f"AUTH={secrets['bearer']}",
+                    f"CLONE={secrets['password-url']}",
+                    f"CONTACT={secrets['email']}",
+                    f"PHONE={secrets['phone']}",
+                    f"CARD={secrets['card']}",
+                    f"SSN={secrets['ssn']}",
+                    f"TOKEN={secrets['jwt']}",
+                    secrets["private-key"],
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "customers.json").write_text(
+            json.dumps(
+                {
+                    "password": structured_values["json-password"],
+                    "api_key": structured_values["json-apikey"],
+                    "customer": {
+                        "customer_email": structured_values["json-token"],
+                        "account_number": structured_values["json-account"],
+                        "name": "Acme Storefront",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "billing.yaml").write_text(
+            "\n".join(
+                [
+                    f"password: {structured_values['yaml-password']}",
+                    f"api_key: {structured_values['yaml-api-key']}",
+                    f"card_number: {structured_values['yaml-card-field']}",
+                    "host: keep-billing-host",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "pii.txt").write_text(
+            "\n".join(
+                [
+                    f"email={pii_values['customer-email']}",
+                    f"phone={pii_values['customer-phone']}",
+                    f"card={pii_values['customer-card']}",
+                    f"ssn={pii_values['customer-ssn']}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / ".env").write_text(f"SECRET={excluded_values['.env']}\n", encoding="utf-8")
+        (root / ".env.production").write_text(
+            f"SECRET={excluded_values['.env.production']}\n", encoding="utf-8"
+        )
+        (root / "secrets.yaml").write_text(
+            f"password: {excluded_values['secrets.yaml']}\n", encoding="utf-8"
+        )
+        (root / "credentials.json").write_text(
+            json.dumps({"token": excluded_values["credentials.json"]}) + "\n",
+            encoding="utf-8",
+        )
+        (root / "id_rsa").write_text(excluded_values["id_rsa"] + "\n", encoding="utf-8")
+        (root / "tls.pem").write_text(excluded_values["tls.pem"] + "\n", encoding="utf-8")
+        (root / "app.key").write_text(excluded_values["app.key"] + "\n", encoding="utf-8")
+        (root / "service-account.json").write_text(
+            json.dumps({"private_key": excluded_values["service-account.json"]}) + "\n",
+            encoding="utf-8",
+        )
+        (root / ".git-credentials").write_text(
+            excluded_values[".git-credentials"] + "\n", encoding="utf-8"
+        )
+
+        dump = collector.collect(str(root))
+        check("safe-source" in dump, "non-sensitive source still reaches the dump")
+        check("Acme Storefront" in dump, "non-sensitive JSON fields still reach the dump")
+        check("keep-billing-host" in dump, "non-sensitive YAML fields still reach the dump")
+        _assert_absent(dump, regex_values, "regex secrets in collector dump")
+        _assert_absent(dump, structured_values, "JSON/YAML field values in collector dump")
+        _assert_absent(dump, pii_values, "PII/financial values in collector dump")
+        _assert_absent(dump, excluded_values, "filename/suffix-excluded file contents in collector dump")
+        for marker in (
+            sanitizer.REDACTED["aws-access-key"],
+            sanitizer.REDACTED["email"],
+            sanitizer.REDACTED["card"],
+            structured.FIELD_PLACEHOLDER,
+        ):
+            check(marker in dump, f"sanitized dump contains {marker}")
+
+        records: list[str] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(self.format(record))
+
+        handler = _ListHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        collector_server.log.addHandler(handler)
+        previous_level = collector_server.log.level
+        collector_server.log.setLevel(logging.DEBUG)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), collector_server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/collect",
+                data=json.dumps({"repository": str(root)}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read().decode("utf-8")
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            payload = exc.read().decode("utf-8", errors="replace")
+            status = exc.code
+            check(False, f"HTTP /collect failed ({status}): {payload[:200]!r}")
+            payload = ""
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            collector_server.log.removeHandler(handler)
+            collector_server.log.setLevel(previous_level)
+
+        check(status == 200, "HTTP /collect returns 200 for the security fixture")
+        check(payload == dump, "tool payload matches the sanitized collector dump")
+        _assert_absent(payload, forbidden, "tool payload")
+        joined_logs = "\n".join(records)
+        _assert_absent(joined_logs, forbidden, "collector logs")
+
+
+def _llm_env(**values: str | None) -> dict[str, str | None]:
+    keys = ("LOCAL_LLM_ENABLED", "LOCAL_LLM_URL", "LOCAL_LLM_TIMEOUT_SECONDS")
+    previous = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    for key, value in values.items():
+        if value is not None:
+            os.environ[key] = value
+    return previous
+
+
+def _restore_env(previous: dict[str, str | None]) -> None:
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_local_llm_detector() -> None:
+    print("\nlocal LLM detector")
+    import local_llm  # noqa: E402
+    from http.server import BaseHTTPRequestHandler
+
+    src = (ROOT / "tools" / "repository-collector" / "local_llm.py").read_text(encoding="utf-8")
+    check("import logging" not in src, "Local LLM client does not log detections")
+
+    previous = _llm_env()
+    try:
+        detector = local_llm.LocalLLMDetector.from_env()
+        check(not detector.enabled, "Local LLM is disabled by default")
+        check(detector.detect("token=super-secret") == [], "disabled detector returns no detections")
+        check(local_llm.augment("already-sanitized") == "already-sanitized", "disabled augment is a no-op")
+    finally:
+        _restore_env(previous)
+
+    previous = _llm_env(LOCAL_LLM_ENABLED="true", LOCAL_LLM_URL="http://127.0.0.1:65534", LOCAL_LLM_TIMEOUT_SECONDS="1")
+    try:
+        detector = local_llm.LocalLLMDetector.from_env()
+        check(detector.enabled, "Local LLM enables when LOCAL_LLM_ENABLED and LOCAL_LLM_URL are set")
+        original = "keep-this-text"
+        check(detector.detect(original) == [], "unavailable endpoint yields no detections")
+        check(local_llm.augment(original) == original, "unavailable endpoint leaves sanitized text unchanged")
+    finally:
+        _restore_env(previous)
+
+    marker = "LLM_SPAN_ONLY"
+    sanitized = f"prefix {marker} suffix"
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            text = body.get("text") or ""
+            start = text.find(marker)
+            payload = {
+                "redacted_text": "untrusted-rewrite",
+                "detections": [
+                    {
+                        "type": "secret",
+                        "start": start,
+                        "end": start + len(marker),
+                        "value": marker,
+                        "replacement": "untrusted-rewrite",
+                    }
+                ],
+            }
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        previous = _llm_env(LOCAL_LLM_ENABLED="true", LOCAL_LLM_URL=url, LOCAL_LLM_TIMEOUT_SECONDS="2")
+        try:
+            detector = local_llm.LocalLLMDetector.from_env()
+            detections = detector.detect(sanitized)
+            check(len(detections) == 1, "valid structured detections are parsed")
+            check(detections[0].type == "secret" and detections[0].start >= 0, "detection has type and positions")
+            redacted = local_llm.augment(sanitized, detector)
+            check(marker not in redacted, "our redactor masks the detected span")
+            check("untrusted-rewrite" not in redacted, "model-produced replacement text is ignored")
+            check("[REDACTED:secret]" in redacted, "placeholder comes from our redactor")
+            check(redacted.startswith("prefix ") and redacted.endswith(" suffix"), "surrounding sanitized text is kept")
+        finally:
+            _restore_env(previous)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    ignored = local_llm.parse_detections(
+        {"redacted_text": "wiped", "detections": [{"type": "secret", "start": -1, "end": 4}]},
+        10,
+    )
+    check(ignored == [], "invalid spans are dropped")
+    applied = local_llm.apply_detections(
+        "abcdefghij",
+        [local_llm.Detection("secret", 2, 5)],
+    )
+    check(applied == "ab[REDACTED:secret]fghij", "apply_detections masks by start/end only")
+
+    previous = _llm_env()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llm-off-repo"
+            root.mkdir()
+            (root / "readme.md").write_text("hello from optional llm off\n", encoding="utf-8")
+            dump = collector.collect(str(root))
+            check("hello from optional llm off" in dump, "collector runs without a Local LLM endpoint")
+    finally:
+        _restore_env(previous)
+
+
+def _host_modules():
+    app_dir = str(ROOT / "app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+    import ark_client  # noqa: E402
+    import validation  # noqa: E402
+
+    return validation, ark_client
+
+
+def _expect_invalid(validate, error_type, url: str, ref: str, needle: str, label: str) -> None:
+    try:
+        validate(url, ref)
+        check(False, label)
+    except error_type as exc:
+        check(needle.lower() in str(exc).lower(), f"{label} (got {exc!r})")
+    except Exception as exc:
+        check(False, f"{label} raised {type(exc).__name__}: {exc}")
+
+
+def test_input_validation() -> None:
+    print("\ninput validation")
+    validation, ark_client = _host_modules()
+
+    github, ref = validation.validate_pipeline_input("https://github.com/MooAyman/github-mcp-chatbot")
+    check(github == "https://github.com/MooAyman/github-mcp-chatbot" and ref == "", "GitHub HTTPS URL is accepted")
+
+    gitlab, _ = validation.validate_pipeline_input("https://gitlab.com/group/project.git/")
+    check(gitlab == "https://gitlab.com/group/project.git", "gitlab.com URL is accepted and trailing slash stripped")
+
+    hosted, hosted_ref = validation.validate_pipeline_input(
+        "http://gitlab.example.com:8080/group/sub/project",
+        " develop ",
+    )
+    check(
+        hosted == "http://gitlab.example.com:8080/group/sub/project" and hosted_ref == "develop",
+        "self-hosted GitLab HTTP URL with nested groups is accepted",
+    )
+
+    tagged, sha_ref = validation.validate_pipeline_input(
+        TARGET_REPO,
+        "v1.3.0",
+    )
+    check(tagged == TARGET_REPO and sha_ref == "v1.3.0", "tag ref syntax is accepted")
+    _, commit = validation.validate_pipeline_input(TARGET_REPO, "abcdeff")
+    check(commit == "abcdeff", "short commit SHA syntax is accepted")
+    _, missing = validation.validate_pipeline_input(TARGET_REPO, "this-ref-does-not-exist-xyz")
+    check(missing == "this-ref-does-not-exist-xyz", "ref existence is not checked here")
+    _, branch = validation.validate_pipeline_input(TARGET_REPO, "feature/better-docs")
+    check(branch == "feature/better-docs", "hierarchical branch names are accepted")
+
+    message = ark_client.build_input("https://github.com/a/b", "main")
+    check(
+        message == "Document this repository: https://github.com/a/b ref: main",
+        "build_input keeps the V1.3.0 Query sentence after validation",
+    )
+
+    cases = [
+        ("", "", "required", "empty URL is rejected"),
+        ("/tmp/repo", "", "local filesystem", "Unix local path is rejected"),
+        (r"C:\Users\me\repo", "", "local filesystem", "Windows local path is rejected"),
+        ("./repo", "", "local filesystem", "relative local path is rejected"),
+        ("git@github.com:owner/repo.git", "", "http or https", "SCP Git URL is rejected"),
+        ("git://github.com/owner/repo", "", "http or https", "git:// URL is rejected"),
+        ("ssh://git@github.com/owner/repo", "", "http or https", "ssh:// URL is rejected"),
+        ("https://user:token@github.com/owner/repo", "", "credential", "embedded userinfo is rejected"),
+        ("https://github.com/owner", "", "owner/repository", "GitHub URL missing repository is rejected"),
+        ("https://github.com/owner/repo/tree/main", "", "owner/repository", "GitHub web UI path is rejected"),
+        ("https://gitlab.com/group/project/-/blob/main/README.md", "", "clone URL", "GitLab web UI path is rejected"),
+        ("https://github.com/owner/repo?foo=1", "", "query string", "query string is rejected"),
+        ("https://github.com/owner/repo#readme", "", "fragment", "fragment is rejected"),
+        ("https://github.com/", "", "owner/repository", "URL with empty path is rejected"),
+    ]
+    for url, ref, needle, label in cases:
+        _expect_invalid(validation.validate_pipeline_input, validation.ValidationError, url, ref, needle, label)
+
+    ref_cases = [
+        ("-bad", "must not start", "ref starting with '-' is rejected"),
+        ("has space", "syntax", "ref with spaces is rejected"),
+        ("foo..bar", "syntax", "ref with '..' is rejected"),
+        ("foo~1", "syntax", "revision syntax is rejected"),
+        ("@", "syntax", "lone '@' is rejected"),
+        ("heads/.hidden", "syntax", "ref component starting with '.' is rejected"),
+    ]
+    for ref, needle, label in ref_cases:
+        _expect_invalid(validation.validate_pipeline_input, validation.ValidationError, TARGET_REPO, ref, needle, label)
+
+    try:
+        ark_client.build_input("https://user:pass@github.com/a/b")
+        check(False, "build_input rejects credentials before Query construction")
+    except ark_client.ValidationError as exc:
+        check("credential" in str(exc).lower(), "build_input credential error is a ValidationError")
 
 
 def test_ref_handling() -> None:
@@ -506,6 +1203,14 @@ def test_pipeline_config() -> None:
         r"windowsPath: C:\Users\moham\source\repos\repository-documentation\out" in values,
         "renderer output bind is the Windows out/ directory",
     )
+    ark_client_src = (ROOT / "app" / "ark_client.py").read_text(encoding="utf-8")
+    ui_src = (ROOT / "app" / "ui.py").read_text(encoding="utf-8")
+    check("validate_pipeline_input" in ark_client_src, "ark_client validates before building Query input")
+    check("validate_pipeline_input" in ui_src, "Streamlit validates before applying a Query")
+    collector_src = (ROOT / "tools" / "repository-collector" / "collector.py").read_text(encoding="utf-8")
+    check("sanitize(" in collector_src, "collector dump is regex-sanitized before it is returned")
+    check("sanitize_structured(" in collector_src, "collector dump is structured-field sanitized before regex")
+    check("apply_local_llm_detections" in collector_src, "optional Local LLM is a post-pass after deterministic sanitization")
 
 
 def renderer_artifact(filename: str) -> str | None:
@@ -609,6 +1314,11 @@ def main() -> int:
     test_determinism_and_render()
     test_budget_and_errors()
     test_urls_and_invalid_input()
+    test_dump_sanitization()
+    test_structured_sanitization()
+    test_security_verification()
+    test_local_llm_detector()
+    test_input_validation()
     test_ref_handling()
     test_git_errors()
     test_gitlab_auth_abstraction()

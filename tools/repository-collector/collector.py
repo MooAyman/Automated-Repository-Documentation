@@ -1,10 +1,13 @@
 """Deterministic repository collection.
 
 Turns a GitHub/GitLab URL or a local path into a single plain-text dump that
-preserves relative paths, directory structure and source code.
+preserves relative paths, directory structure and source code. File contents
+are structured-field sanitized (JSON/YAML) then regex-sanitized in render()
+before the dump is returned. An optional Local LLM detector may add extra
+span redactions after that deterministic pass; it is off by default.
 
-This module knows nothing about ARK, HTTP or LLMs. Its only responsibility is
-repository acquisition and preparation.
+This module knows nothing about ARK. Optional Local LLM detection is a
+post-pass after deterministic sanitization and is disabled by default.
 """
 
 from __future__ import annotations
@@ -17,6 +20,10 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+
+from sanitizer import sanitize
+from structured import sanitize_structured
+from local_llm import augment as apply_local_llm_detections
 
 SEPARATOR = "=" * 50
 RULE = "-" * 50
@@ -535,9 +542,11 @@ def render(collection: Collection) -> str:
         out.append("")
 
     for entry in included:
-        out += ["", SEPARATOR, f"FILE: {entry.path}", SEPARATOR, "", entry.text.rstrip("\n"), ""]
+        body = sanitize_structured(entry.path, entry.text)
+        out += ["", SEPARATOR, f"FILE: {entry.path}", SEPARATOR, "", body.rstrip("\n"), ""]
 
-    return "\n".join(out)
+    dump = sanitize("\n".join(out))
+    return apply_local_llm_detections(dump)
 
 
 def collect_into(

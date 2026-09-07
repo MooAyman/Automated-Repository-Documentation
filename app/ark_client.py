@@ -1,6 +1,7 @@
 """Submit and watch ARK Queries for Agent/repository-pipeline.
 
-This is a host-side client. It does not call the collector or renderer.
+This is a host-side client. It validates URL and ref, then applies a Query.
+It does not call the collector or renderer.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Callable
+
+from validation import ValidationError, validate_pipeline_input
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "out"
@@ -27,11 +30,8 @@ _HTML_NAME = re.compile(r"([A-Za-z0-9._-]+\.html)")
 
 
 def build_input(repository_url: str, ref: str = "") -> str:
-    url = repository_url.strip()
-    if not url:
-        raise ValueError("repository URL is required")
+    url, ref = validate_pipeline_input(repository_url, ref)
     message = f"Document this repository: {url}"
-    ref = ref.strip()
     if ref:
         message = f"{message} ref: {ref}"
     return message
@@ -144,6 +144,11 @@ if __name__ == "__main__":
     assert build_input("https://github.com/a/b", " develop ") == (
         "Document this repository: https://github.com/a/b ref: develop"
     )
+    try:
+        build_input("/tmp/repo")
+        raise AssertionError("local paths must fail validation")
+    except ValidationError:
+        pass
     name = query_name("https://github.com/MooAyman/github-mcp-chatbot.git")
     assert name.startswith("ui-github-mcp-chatbot-")
     assert filename_from_response("Output:\ngithub-mcp-chatbot.html") == (

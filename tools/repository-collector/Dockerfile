@@ -6,7 +6,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY collector.py server.py ./
+COPY collector.py server.py sanitizer.py structured.py local_llm.py ./
 
 # Runs as an unprivileged user with a read-only root filesystem; /tmp is an
 # emptyDir volume supplied by the Deployment and is the only writable location,

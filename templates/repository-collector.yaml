@@ -49,6 +49,12 @@ spec:
               value: {{ .Values.logging.level | quote }}
             - name: CLONE_TIMEOUT_SECONDS
               value: "300"
+            - name: LOCAL_LLM_ENABLED
+              value: {{ .Values.collector.localLlm.enabled | default false | quote }}
+            - name: LOCAL_LLM_URL
+              value: {{ .Values.collector.localLlm.url | default "" | quote }}
+            - name: LOCAL_LLM_TIMEOUT_SECONDS
+              value: {{ .Values.collector.localLlm.timeoutSeconds | default 3 | quote }}
             {{- with .Values.collector.localRepoRoot }}
             - name: LOCAL_REPO_ROOT
               value: {{ . | quote }}

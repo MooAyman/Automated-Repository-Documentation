@@ -325,8 +325,12 @@ def main() -> None:
                 width="stretch",
             )
         if submitted:
-            if not url.strip():
-                st.session_state["error"] = "Repository URL is required."
+            try:
+                ark_client.validate_pipeline_input(url, ref)
+            except ark_client.ValidationError as exc:
+                st.session_state.pop("last_artifact", None)
+                st.session_state.pop("last_html", None)
+                st.session_state["error"] = str(exc)
             else:
                 _run_pipeline(url, ref)
 

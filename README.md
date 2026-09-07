@@ -10,6 +10,7 @@ You can run the same pipeline from the CLI or from the host Streamlit UI.
 
 ```text
 User  (ark query  or  Streamlit UI)
+  ↓  Streamlit: host-side URL/ref validation (no LLM, no clone)
   ↓  one ARK Query
 Agent/repository-pipeline          orchestrator (no analysis, no HTML)
   ↓  Agent-as-Tool
@@ -31,22 +32,25 @@ Windows host
 | `repository-documentation` | Agent         | Call the collector once, analyse the dump, fill `spec.outputSchema`.                                                                      |
 | `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump.                                                          |
 | `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
-| Streamlit UI (`app/`)      | host client   | Collects URL and optional ref, applies one Query to `repository-pipeline`, then opens or downloads `out/<repo>.html`.                     |
+| Streamlit UI (`app/`)      | host client   | Validates URL and optional ref, applies one Query to `repository-pipeline`, then opens or downloads `out/<repo>.html`. |
 | ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, the collector Deployment/Service, and the renderer Service (host-backed when `hostDocker` is true).       |
 
 Collector and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The documentation Agent owns analysis; the pipeline Agent only sequences the two stages. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
 
-The Streamlit app does not call the collector or renderer. It submits the same Query the CLI uses.
+The Streamlit app does not call the collector or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses.
 
 ## Features
 
 - One-command ARK pipeline (`ark query agent/repository-pipeline …`)
-- Streamlit UI that submits that same Query and reads the HTML from `out/`
+- Streamlit UI that validates the URL/ref, then submits that same Query and reads the HTML from `out/`
+- Deterministic URL and ref validation before a Query starts (no LLM)
 - Public GitHub repositories
 - Public GitLab (`gitlab.com` and self-hosted) repositories
 - Private / self-hosted GitLab via a cluster Secret (`GITLAB_TOKEN`); the token is not sent with each query
 - Optional `ref` (branch, tag, or commit); omitted `ref` uses the default branch
 - Missing `ref` fails; the collector does not fall back
+- Deterministic regex redaction of secrets and PII in the collector dump before it reaches the model
+- Deterministic JSON/YAML field redaction by sensitive key names before the dump reaches the model
 - Dump-grounded documentation prompt with three evidence levels: confirmed, `Inferred:`, and `Not determinable from the repository.` as a last resort
 - Strict structured JSON (`Agent.spec.outputSchema`)
 - Deterministic HTML rendering (no LLM)
@@ -79,7 +83,7 @@ kubectl get model default
 Build images (Docker Desktop uses the local image store; no `docker push` is required). Tags match `values.yaml`:
 
 ```powershell
-docker build -t localhost:5000/repository-documentation-repository-collector:m4 tools/repository-collector
+docker build -t localhost:5000/repository-documentation-repository-collector:m7 tools/repository-collector
 docker build -t localhost:5000/repository-documentation-documentation-renderer:m5 tools/documentation-renderer
 ```
 
@@ -172,7 +176,7 @@ pip install -r app\requirements.txt
 python -m streamlit run app\ui.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. The app applies one Query to `agent/repository-pipeline` (timeout 15m), waits for `done`, and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
+Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. Invalid input is rejected before a Query is applied. The app applies one Query to `agent/repository-pipeline` (timeout 15m), waits for `done`, and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
 
 The UI does not change Agents, Tools, prompts, or schemas.
 
@@ -297,7 +301,7 @@ The pipeline Agent stops after a failed stage and does not call the renderer or 
 ## Testing
 
 ```powershell
-python tests/test_collector.py            # collector, renderer unit tests, pipeline config
+python tests/test_collector.py            # collector, renderer, validation, dump sanitization, pipeline config
 python tests/test_collector.py --network  # live clone of the GitHub test repo
 python tests/test_collector.py --e2e      # deployed repository-pipeline Query and HTML artifact
 ```
@@ -320,6 +324,7 @@ agents/                         ARK Agent CRs (pipeline + documentation)
 app/                            Streamlit UI (host-side Query client)
   ui.py
   ark_client.py
+  validation.py
   requirements.txt
   assets/aman-logo.png
 observability/langfuse-cloud.md Langfuse Cloud OTEL setup
@@ -327,7 +332,7 @@ templates/                      Helm templates (RBAC, Tools, Agents, collector, 
 tools/                          Tool CRs and HTTP service source
   repository-collector/
   documentation-renderer/
-tests/test_collector.py         Collector, renderer, pipeline config, and --e2e
+tests/test_collector.py         Collector, renderer, host validation, pipeline config, and --e2e
 values.yaml
 Chart.yaml
 out/                            Generated HTML (host bind; not a pipeline input)
@@ -336,7 +341,9 @@ out/                            Generated HTML (host bind; not a pipeline input)
 ## Security
 
 - GitLab PAT: Kubernetes Secret only; host-scoped git `extraHeader`; redacted from URLs, argv, child env, and logs.
+- Streamlit UI rejects local paths and URLs with embedded credentials before a Query starts.
 - Collector drops `.env`, private keys, binaries, lockfiles, and dependency/cache/`.git` directories; `.env.example` is kept.
+- Collector dump: a deterministic regex sanitizer redacts API keys, tokens, JWTs, private keys, emails, phones, and card numbers before the dump is returned. JSON/YAML field names such as password, token, and api_key have their values redacted while keys are kept. Matched values are not logged. An optional Local LLM detector can add extra span findings after that pass; it is disabled by default (`LOCAL_LLM_ENABLED=false`) and is not required to run.
 - Renderer HTML-escapes repository content (no raw script injection).
 - Collector Deployment: non-root, read-only root filesystem, dropped capabilities. The renderer image also runs as uid 1001; with `hostDocker` it is the host container `documentation-renderer-host`, not an in-cluster pod.
 - No API keys or tokens in this repository. `.env` is gitignored.

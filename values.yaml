@@ -14,7 +14,7 @@ collector:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-collector
-    tag: m4
+    tag: m7
     # Docker Desktop Kubernetes caches :latest; bump this tag when the image changes.
     pullPolicy: IfNotPresent
   # Disk budget for transient clones (mounted at /tmp).
@@ -22,6 +22,13 @@ collector:
   # Restrict local-path collection to this directory. Empty means local paths are
   # resolved anywhere inside the container (which only ever holds clones).
   localRepoRoot: ""
+  # Optional extra detector. Off by default; the collector runs without it.
+  # When enabled, POST {"text": "<already sanitized dump>"} to url and expect
+  # {"detections": [{"type": "secret", "start": 0, "end": 4}]}.
+  localLlm:
+    enabled: false
+    url: ""
+    timeoutSeconds: 3
   resources:
     limits:
       memory: "1Gi"
