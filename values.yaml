@@ -50,6 +50,48 @@ gitlab:
     name: ""
     key: token
 
+# HTTP service backing the `repository-analyzer` ARK Tool.
+# `name` and `port` must stay in sync with tools/repository-analyzer.yaml.
+# Accepts already-sanitized source only; it does not clone repositories.
+analyzer:
+  enabled: true
+  name: repository-analyzer
+  port: 8080
+  replicas: 1
+  image:
+    repository: localhost:5000/repository-documentation-repository-analyzer
+    tag: m1
+    pullPolicy: IfNotPresent
+  workspaceSizeLimit: 64Mi
+  resources:
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+
+# HTTP service backing the `repository-map` ARK Tool.
+# `name` and `port` must stay in sync with tools/repository-map.yaml.
+# Accepts already-sanitized analyzer JSON only; it does not clone or parse source.
+mapper:
+  enabled: true
+  name: repository-map
+  port: 8080
+  replicas: 1
+  image:
+    repository: localhost:5000/repository-documentation-repository-map
+    tag: m1
+    pullPolicy: IfNotPresent
+  workspaceSizeLimit: 64Mi
+  resources:
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+
 # HTTP service backing the `documentation-renderer` ARK Tool.
 # `name` and `port` must stay in sync with tools/documentation-renderer.yaml.
 renderer:
@@ -105,7 +147,7 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# LOG_LEVEL on collector and renderer containers.
+# LOG_LEVEL on collector, analyzer, map, and renderer containers.
 logging:
   level: INFO
 

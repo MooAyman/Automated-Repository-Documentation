@@ -1,0 +1,47 @@
+# ARK Tool: deterministic Python AST analysis of already-sanitized source.
+#
+# Called by Agent/repository-documentation after repository-collector.
+# Accepts sanitized per-file content (preferred) or the sanitized collector
+# dump. Does not clone repositories or call a language model.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-analyzer
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Analyzes already-sanitized repository source with a conservative Python
+    AST. Returns classes, functions, parameter names, imports, decorator
+    names, inheritance names, direct calls, and basic references. Pass the
+    collector dump or sanitized per-file {path, content}. Do not pass a
+    repository URL or unsanitized source. Non-Python files are unsupported.
+    Unparseable Python is reported, not guessed. Additional evidence only;
+    the collector dump remains the source of truth.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    properties:
+      dump:
+        type: string
+        description: >-
+          The already-sanitized collector dump, unchanged. The analyzer
+          splits FILE sections and analyzes Python files only. Prefer this
+          when calling from the documentation agent after collection.
+      filesJson:
+        type: string
+        description: >-
+          Optional JSON array of {path, content} objects whose content is
+          already sanitized. When set, it is used instead of dump.
+  http:
+    url: http://repository-analyzer.default.svc.cluster.local:8080/analyze
+    method: POST
+    timeout: 60s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {{if .input.filesJson}}{"files": {{.input.filesJson}}}{{else}}{"dump": {{printf "%q" .input.dump}}}{{end}}

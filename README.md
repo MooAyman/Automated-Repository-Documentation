@@ -17,6 +17,10 @@ Agent/repository-pipeline          orchestrator (no analysis, no HTML)
 Agent/repository-documentation     analysis + spec.outputSchema JSON
   ↓  HTTP Tool
 Tool/repository-collector          clone, filter, deterministic text dump
+  ↓  HTTP Tool
+Tool/repository-analyzer           Python AST + unique cross-file references (sanitized input only)
+  ↓  HTTP Tool
+Tool/repository-map                deterministic modules/symbols/relationships (analyzer JSON only)
   ↓
 Structured JSON
   ↓  HTTP Tool
@@ -29,15 +33,17 @@ Windows host
 | Resource                   | Kind          | Responsibility                                                                                                                            |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `repository-pipeline`      | Agent         | Extract URL and optional `ref`, call the documentation Agent once, pass the JSON unchanged to the renderer, return the artifact filename. |
-| `repository-documentation` | Agent         | Call the collector once, analyse the dump, fill `spec.outputSchema`.                                                                      |
+| `repository-documentation` | Agent         | Call collector, analyzer, then map; analyse the dump (source of truth) plus that deterministic evidence; fill `spec.outputSchema`.         |
 | `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump.                                                          |
+| `repository-analyzer`      | Tool (`http`) | Conservative Python AST on already-sanitized files/dump. Resolves unique same-file and imported cross-file references. Does not clone.    |
+| `repository-map`           | Tool (`http`) | Deterministic Repository Map from analyzer JSON: modules, symbols, relationships, tree. No clone, no AST, no LLM.                         |
 | `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
 | Streamlit UI (`app/`)      | host client   | Validates URL and optional ref, applies one Query to `repository-pipeline`, then opens or downloads `out/<repo>.html`. |
-| ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, the collector Deployment/Service, and the renderer Service (host-backed when `hostDocker` is true).       |
+| ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, collector/analyzer/map Deployments/Services, and the renderer Service (host-backed when `hostDocker` is true). |
 
-Collector and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The documentation Agent owns analysis; the pipeline Agent only sequences the two stages. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
+Collector, analyzer, map, and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The analyzer accepts only already-sanitized content (never a clone). The map accepts only analyzer JSON. The documentation Agent owns analysis; the pipeline Agent only sequences documentation then render. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
 
-The Streamlit app does not call the collector or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses.
+The Streamlit app does not call the collector, analyzer, map, or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses.
 
 ## Features
 
@@ -51,6 +57,8 @@ The Streamlit app does not call the collector or renderer. It validates the URL 
 - Missing `ref` fails; the collector does not fall back
 - Deterministic regex redaction of secrets and PII in the collector dump before it reaches the model
 - Deterministic JSON/YAML field redaction by sensitive key names before the dump reaches the model
+- Conservative Python AST analysis (classes, functions, imports, unique cross-file references) on already-sanitized source only
+- Deterministic Repository Map (modules, symbols, relationships, file tree) built from analyzer JSON only
 - Dump-grounded documentation prompt with three evidence levels: confirmed, `Inferred:`, and `Not determinable from the repository.` as a last resort
 - Strict structured JSON (`Agent.spec.outputSchema`)
 - Deterministic HTML rendering (no LLM)
@@ -84,6 +92,8 @@ Build images (Docker Desktop uses the local image store; no `docker push` is req
 
 ```powershell
 docker build -t localhost:5000/repository-documentation-repository-collector:m7 tools/repository-collector
+docker build -t localhost:5000/repository-documentation-repository-analyzer:m1 tools/repository-analyzer
+docker build -t localhost:5000/repository-documentation-repository-map:m1 tools/repository-map
 docker build -t localhost:5000/repository-documentation-documentation-renderer:m5 tools/documentation-renderer
 ```
 
@@ -110,10 +120,10 @@ Verify:
 
 ```powershell
 kubectl get agent repository-pipeline repository-documentation
-kubectl get tool repository-documentation repository-collector documentation-renderer
+kubectl get tool repository-documentation repository-collector repository-analyzer repository-map documentation-renderer
 ```
 
-Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
+Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-analyzer` (http), `repository-map` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
 
 With `renderer.output.hostDocker: true` (this chart's default), there is no in-cluster renderer Deployment. Confirm the host container instead:
 
@@ -159,7 +169,7 @@ The collector injects `GITLAB_TOKEN` from that Secret and authenticates with a h
 ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot"
 ```
 
-That single Query runs `repository-pipeline` → `repository-documentation` → `repository-collector` → `documentation-renderer` → HTML. You do not retrieve or paste the JSON. There is no standalone documentation Query.
+That single Query runs `repository-pipeline` → `repository-documentation` → `repository-collector` → `repository-analyzer` → `repository-map` → `documentation-renderer` → HTML. You do not retrieve or paste the JSON. There is no standalone documentation Query.
 
 Optional ref (also accepted as `branch: …`):
 
@@ -242,7 +252,7 @@ The documentation Agent fills `spec.outputSchema`. The renderer turns that JSON 
 
 Grounding rules (documentation Agent prompt):
 
-- The collector dump is the only source of truth.
+- The collector dump is the source of truth. Analyzer JSON and the Repository Map are extra deterministic evidence.
 - Do not invent files, functions, endpoints, env vars, commands, or behaviour.
 - Cite relative paths for concrete claims.
 - Three evidence levels: confirmed (plain statement + path), `Inferred: …`, and `Not determinable from the repository.` only as a last resort.
@@ -301,7 +311,7 @@ The pipeline Agent stops after a failed stage and does not call the renderer or 
 ## Testing
 
 ```powershell
-python tests/test_collector.py            # collector, renderer, validation, dump sanitization, pipeline config
+python tests/test_collector.py            # collector, analyzer, map, renderer, validation, dump sanitization, pipeline config
 python tests/test_collector.py --network  # live clone of the GitHub test repo
 python tests/test_collector.py --e2e      # deployed repository-pipeline Query and HTML artifact
 ```
@@ -328,11 +338,13 @@ app/                            Streamlit UI (host-side Query client)
   requirements.txt
   assets/aman-logo.png
 observability/langfuse-cloud.md Langfuse Cloud OTEL setup
-templates/                      Helm templates (RBAC, Tools, Agents, collector, renderer Service)
+templates/                      Helm templates (RBAC, Tools, Agents, collector, analyzer, map, renderer Service)
 tools/                          Tool CRs and HTTP service source
   repository-collector/
+  repository-analyzer/
+  repository-map/
   documentation-renderer/
-tests/test_collector.py         Collector, renderer, host validation, pipeline config, and --e2e
+tests/test_collector.py         Collector, analyzer, map, renderer, host validation, pipeline config, and --e2e
 values.yaml
 Chart.yaml
 out/                            Generated HTML (host bind; not a pipeline input)
@@ -344,6 +356,8 @@ out/                            Generated HTML (host bind; not a pipeline input)
 - Streamlit UI rejects local paths and URLs with embedded credentials before a Query starts.
 - Collector drops `.env`, private keys, binaries, lockfiles, and dependency/cache/`.git` directories; `.env.example` is kept.
 - Collector dump: a deterministic regex sanitizer redacts API keys, tokens, JWTs, private keys, emails, phones, and card numbers before the dump is returned. JSON/YAML field names such as password, token, and api_key have their values redacted while keys are kept. Matched values are not logged. An optional Local LLM detector can add extra span findings after that pass; it is disabled by default (`LOCAL_LLM_ENABLED=false`) and is not required to run.
+- Analyzer input is that sanitized dump or sanitized per-file content only. The analyzer does not clone, does not read raw collector entries, and does not emit source snippets, defaults, or call/decorator arguments.
+- Repository Map input is analyzer JSON only. It does not clone, parse source, or emit snippets or secrets.
 - Renderer HTML-escapes repository content (no raw script injection).
 - Collector Deployment: non-root, read-only root filesystem, dropped capabilities. The renderer image also runs as uid 1001; with `hostDocker` it is the host container `documentation-renderer-host`, not an in-cluster pod.
 - No API keys or tokens in this repository. `.env` is gitignored.
@@ -374,6 +388,10 @@ Not implemented as user-facing features:
 
 ### Architecture
 
+- Additional programming-language analyzers (Python AST is implemented)
+- JSON/YAML structural analyzers (not AST)
+- Advanced semantic / data-flow / full call-graph resolution
+- LLM-based architecture or business-component inference
 - Multi-stage Repository Analysis
 - LLM-based Repository Analyzer
 - Multi-Agent Documentation Team

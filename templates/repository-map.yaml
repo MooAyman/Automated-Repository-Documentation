@@ -1,0 +1,98 @@
+{{/*
+Repository Map - HTTP service backing Tool/repository-map.
+Service name is fixed so tools/repository-map.yaml can use a stable FQDN.
+*/}}
+{{- if .Values.mapper.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.mapper.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: mapper
+spec:
+  replicas: {{ .Values.mapper.replicas }}
+  selector:
+    matchLabels:
+      {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 6 }}
+      component: mapper
+  template:
+    metadata:
+      labels:
+        {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 8 }}
+        component: mapper
+    spec:
+      serviceAccountName: {{ include "{{ .Values.project.name }}.serviceAccountName" . }}
+      {{- with .Values.security.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mapper
+          image: "{{ .Values.mapper.image.repository }}:{{ .Values.mapper.image.tag }}"
+          imagePullPolicy: {{ .Values.mapper.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mapper.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.mapper.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+          {{- with .Values.security.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.mapper.resources | nindent 12 }}
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: {{ .Values.mapper.workspaceSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.mapper.name }}
+  labels:
+    {{- include "{{ .Values.project.name }}.labels" . | nindent 4 }}
+    component: mapper
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.mapper.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "{{ .Values.project.name }}.selectorLabels" . | nindent 4 }}
+    component: mapper
+{{- end }}

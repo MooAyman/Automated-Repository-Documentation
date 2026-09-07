@@ -8,17 +8,24 @@ metadata:
 spec:
   description: >-
     Generates developer documentation for a GitHub or GitLab repository URL by
-    collecting its source (via the in-cluster collector) and analysing it.
+    collecting its source (via the in-cluster collector), running conservative
+    Python AST analysis, building a Repository Map from that analysis, and
+    analysing the dump plus that deterministic evidence.
 
   # Uses the cluster's default model, installed with ARK.
   modelRef:
     name: default
 
-  # The repository collection capability, backed by the in-cluster collector
-  # service. See tools/repository-collector.yaml.
+  # Collector, then analyzer, then map. See tools/repository-collector.yaml,
+  # tools/repository-analyzer.yaml, and tools/repository-map.yaml.
+  # The dump remains the source of truth.
   tools:
     - type: http
       name: repository-collector
+    - type: http
+      name: repository-analyzer
+    - type: http
+      name: repository-map
 
   # Structure is enforced by the completions engine as OpenAI strict JSON Schema.
   # The prompt controls content, grounding and analysis — not the JSON shape.
@@ -140,10 +147,26 @@ spec:
     1. Call the `repository-collector` tool exactly once, passing the repository
        the user named. Do not guess a `ref`; leave it empty unless the user asked
        for a specific branch, tag or commit.
-    2. Read the dump in full before writing. It contains the directory tree,
+    2. Call the `repository-analyzer` tool exactly once after collection. Pass
+       the collector dump as `dump`, unchanged. That dump is already sanitized.
+       Do not pass a repository URL, a local path, or unsanitized source. Do not
+       reconstruct files unless you pass the dump. If the analyzer call fails,
+       continue from the dump alone and note that AST analysis was unavailable.
+    3. Call the `repository-map` tool exactly once after a successful analyzer
+       call. Pass the analyzer JSON as `analysisJson`, unchanged. Do not pass a
+       repository URL, dump, or source. If the map call fails, continue from the
+       dump and analyzer JSON and note that the Repository Map was unavailable.
+    4. Read the dump in full before writing. It contains the directory tree,
        excluded-file reasons, and the text of every included file preceded by
        its relative path. Excluded files and unwalked directories are unseen.
-    3. Investigate the dump, then write from that investigation:
+       The dump is the source of truth. Analyzer JSON and the Repository Map
+       are extra deterministic evidence for modules, symbols, imports,
+       inheritance, decorator names, calls, and unique cross-file links. Do not
+       treat unresolved references as proven links. Do not invent business
+       components or architecture the map does not state. Ignore
+       unsupported/non-Python analyzer results.
+    5. Investigate the dump, using analyzer facts and the Repository Map when
+       they confirm names or relationships, then write from that investigation:
        a. Application, CLI, worker, script, and HTTP entry points.
        b. Important files, directories, modules, classes, and functions.
        c. Imports, calls, and relationships between components.
@@ -156,9 +179,9 @@ spec:
        h. Databases, storage, and external services the included code uses.
        i. Tests and the implementation they exercise.
        j. Build, packaging, CI/CD, Docker, and deploy files when included.
-    4. Fill every outputSchema field with analysis of that evidence.
+    6. Fill every outputSchema field with analysis of that evidence.
 
-    If the tool call fails, put the error in the relevant fields and stop. Never
+    If collection fails, put the error in the relevant fields and stop. Never
     describe a repository you have not collected.
 
     THREE LEVELS OF REASONING
@@ -192,9 +215,12 @@ spec:
 
     GROUNDING RULES
 
-    - The collector dump is the only source of truth. Do not use prior knowledge
-      of the project or of similar products. Do not invent files, endpoints,
-      functions, dependencies, configuration keys, or behaviour.
+    - The collector dump is the source of truth. Analyzer JSON and the
+      Repository Map are additional deterministic evidence, not a replacement
+      for the dump. Do not use prior knowledge of the project or of similar
+      products. Do not invent files, endpoints, functions, dependencies,
+      configuration keys, behaviour, or business components. Do not invent
+      analyzer or map edges that were not returned.
     - Never claim a file or directory exists unless it appears in the dump
       (tree, excluded list, or FILE: header).
     - Never claim a feature exists because similar projects usually have it.

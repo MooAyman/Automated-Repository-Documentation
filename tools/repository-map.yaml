@@ -1,0 +1,40 @@
+# ARK Tool: deterministic Repository Map from analyzer JSON.
+#
+# Called by Agent/repository-documentation after repository-analyzer.
+# Accepts already-sanitized analyzer output only. Does not clone, parse
+# source, or call a language model.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-map
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Builds a deterministic Repository Map from repository-analyzer JSON:
+    modules, symbols, relationships, directories/packages, and a file tree.
+    Pass the analyzer result as analysisJson, unchanged. Do not pass a
+    repository URL, collector dump, or source files. Does not infer
+    architecture or business components. Additional evidence only; the
+    collector dump remains the source of truth.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    properties:
+      analysisJson:
+        type: string
+        description: >-
+          The complete repository-analyzer JSON as a JSON string, exactly
+          as returned by repository-analyzer. Do not summarise or rewrite it.
+  http:
+    url: http://repository-map.default.svc.cluster.local:8080/map
+    method: POST
+    timeout: 60s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {"analysis": {{.input.analysisJson}}}

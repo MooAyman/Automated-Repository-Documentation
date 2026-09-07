@@ -28,7 +28,9 @@ spec:
     - repository-documentation: the only way to produce documentation JSON.
     - documentation-renderer: the only way to produce the HTML artifact.
 
-    Do not call repository-collector. The documentation agent already owns it.
+    Do not call repository-collector, repository-analyzer, or repository-map.
+    The documentation agent already owns collection, AST analysis, and the
+    Repository Map.
 
     WHEN THE USER ASKS TO DOCUMENT A REPOSITORY
 

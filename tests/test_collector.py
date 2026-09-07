@@ -549,10 +549,21 @@ def test_security_verification() -> None:
     check("entry.text" not in server_src, "HTTP handler does not send unsanitized file bodies")
     tools_block = docs.split("prompt:", 1)[0]
     check(
-        tools_block.count("type: http") == 1 and "repository-collector" in tools_block,
-        "Documentation Agent receives repository content only via repository-collector",
+        tools_block.count("type: http") == 3
+        and "repository-collector" in tools_block
+        and "repository-analyzer" in tools_block
+        and "repository-map" in tools_block,
+        "Documentation Agent receives repository content via collector, then analyzer and map",
     )
     check("documentation-renderer" not in tools_block, "Documentation Agent does not receive renderer payloads")
+    analyzer_src = (ROOT / "tools" / "repository-analyzer" / "analyzer.py").read_text(encoding="utf-8")
+    check("collect_into" not in analyzer_src and "import collector" not in analyzer_src,
+          "analyzer does not read raw collector entries")
+    mapper_src = (ROOT / "tools" / "repository-map" / "mapper.py").read_text(encoding="utf-8")
+    check("collect_into" not in mapper_src and "import collector" not in mapper_src,
+          "repository map does not read raw collector entries")
+    check("import ast" not in mapper_src and "analyze_repository" not in mapper_src,
+          "repository map does not parse AST or resolve references")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "security-repo"
@@ -1166,6 +1177,631 @@ def apply_query(body: dict) -> bool:
             pass
 
 
+def _analyzer_modules():
+    import importlib
+    import importlib.util
+
+    analyzer_dir = ROOT / "tools" / "repository-analyzer"
+    analyzer_path = str(analyzer_dir)
+    if analyzer_path not in sys.path:
+        sys.path.insert(0, analyzer_path)
+    analyzer = importlib.import_module("analyzer")
+    server_name = "repository_analyzer_server"
+    if server_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(server_name, analyzer_dir / "server.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[server_name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return analyzer, sys.modules[server_name]
+
+
+def _find(items: list[dict], name: str) -> dict | None:
+    return next((item for item in items if item.get("name") == name), None)
+
+
+def _refs(references: list[dict], kind: str, to: str | None = None, frm: str | None = None) -> list[dict]:
+    found = []
+    for ref in references:
+        if ref.get("kind") != kind:
+            continue
+        if to is not None and ref.get("to") != to:
+            continue
+        if frm is not None and ref.get("from") != frm:
+            continue
+        found.append(ref)
+    return found
+
+
+ANALYZER_FIXTURE = """\
+import os
+from collections import deque
+
+def helper(item):
+    return item
+
+class Base:
+    pass
+
+@dataclass
+class Worker(Base):
+    @override
+    def run(self, item, extra, *args, flag, **kwargs):
+        helper(item)
+        self.save()
+        unknown()
+        os.path.join(item, extra)
+        other.module.fn()
+
+    def save(self):
+        helper(self)
+
+async def fetch(url):
+    helper(url)
+"""
+
+
+def test_analyzer() -> None:
+    print("\nAST analyzer")
+    analyzer, analyzer_server = _analyzer_modules()
+
+    src_dir = ROOT / "tools" / "repository-analyzer"
+    for rel in ("analyzer.py", "server.py", "languages/python.py", "languages/__init__.py"):
+        text = (src_dir / rel).read_text(encoding="utf-8")
+        check("import subprocess" not in text and "git clone" not in text, f"{rel} does not shell out or clone")
+        check("collect_into" not in text and "import collector" not in text, f"{rel} does not read collector entries")
+
+    first = analyzer.analyze({"files": [{"path": "src/app.py", "content": ANALYZER_FIXTURE}]})
+    second = analyzer.analyze({"files": [{"path": "src/app.py", "content": ANALYZER_FIXTURE}]})
+    check(first == second, "analyzer output is deterministic")
+    check(first["schemaVersion"] == "1", "schemaVersion is 1")
+    check(first["language"] == "python", "supported language is python")
+    check(len(first["files"]) == 1 and first["files"][0]["status"] == "parsed", "valid Python is parsed")
+    check(first["unparsed"] == [], "valid Python is not unparsed")
+
+    parsed = first["files"][0]
+    check(parsed["path"] == "src/app.py", "parsed path is preserved")
+    worker = _find(parsed["classes"], "Worker")
+    base = _find(parsed["classes"], "Base")
+    check(base is not None and base["qualname"] == "src/app.py::Base", "classes include Base")
+    check(worker is not None and worker["bases"] == ["Base"], "inheritance surface names are recorded")
+    check(worker["decorators"] == ["dataclass"], "class decorator names only")
+    check(worker["qualname"] == "src/app.py::Worker", "class qualname uses path::Name")
+
+    helper = _find(parsed["functions"], "helper")
+    run = _find(parsed["functions"], "run")
+    save = _find(parsed["functions"], "save")
+    fetch = _find(parsed["functions"], "fetch")
+    check(helper is not None and helper["kind"] == "function", "top-level functions are recorded")
+    check(run is not None and run["kind"] == "method" and run["qualname"] == "src/app.py::Worker.run",
+          "methods are recorded with class qualname")
+    check(save is not None and save["kind"] == "method", "second method is recorded")
+    check(fetch is not None and fetch["async"] is True and fetch["kind"] == "function",
+          "async functions are recorded")
+    check(run["parameters"] == ["self", "item", "extra", "args", "flag", "kwargs"],
+          "parameter names only are recorded")
+    check(run["decorators"] == ["override"], "method decorator names only")
+    check("default" not in json.dumps(run), "parameter defaults are not emitted")
+
+    import_kinds = {row["kind"] for row in parsed["imports"]}
+    check("import" in import_kinds and "from" in import_kinds, "import and from-import facts are recorded")
+    check(any(row["module"] == "os" for row in parsed["imports"]), "import module name is recorded")
+    check(any(row["module"] == "collections" and "deque" in row["names"] for row in parsed["imports"]),
+          "from-import names are recorded")
+
+    refs = first["references"]
+    inherit = _refs(refs, "inherit", to="src/app.py::Base", frm="src/app.py::Worker")
+    check(len(inherit) == 1 and inherit[0]["certainty"] == "exact", "same-file inheritance is exact")
+    decorate_worker = _refs(refs, "decorate", to="dataclass", frm="src/app.py::Worker")
+    check(len(decorate_worker) == 1 and decorate_worker[0]["certainty"] == "unresolved",
+          "unknown decorator stays unresolved")
+    helper_call = _refs(refs, "call", to="src/app.py::helper", frm="src/app.py::Worker.run")
+    check(len(helper_call) == 1 and helper_call[0]["certainty"] == "exact",
+          "same-file direct call is exact")
+    save_call = _refs(refs, "call", to="src/app.py::Worker.save", frm="src/app.py::Worker.run")
+    check(len(save_call) == 1 and save_call[0]["certainty"] == "exact",
+          "same-class self.method call is exact")
+    unknown_call = _refs(refs, "call", to="unknown", frm="src/app.py::Worker.run")
+    check(len(unknown_call) == 1 and unknown_call[0]["certainty"] == "unresolved",
+          "unknown call stays unresolved")
+    join_call = _refs(refs, "call", to="os.path.join")
+    check(len(join_call) == 1 and join_call[0]["certainty"] == "unresolved",
+          "imported dotted call is unresolved")
+    foreign_call = _refs(refs, "call", to="other.module.fn")
+    check(len(foreign_call) == 1 and foreign_call[0]["certainty"] == "unresolved",
+          "cross-module call is unresolved")
+    import_refs = _refs(refs, "import")
+    check(import_refs and all(row["certainty"] == "unresolved" for row in import_refs),
+          "import references stay unresolved")
+    check(all("lineno" in row and row["kind"] in {"import", "inherit", "decorate", "call"} for row in refs),
+          "references have kind, from, to, lineno, certainty")
+
+    broken = analyzer.analyze({"files": [{"path": "broken.py", "content": "def broken(\n"}]})
+    check(broken["files"] == [], "invalid Python is not parsed")
+    check(broken["unparsed"] == [{"path": "broken.py", "reason": "SyntaxError"}],
+          "invalid Python is unparsed with a reason")
+    check(broken["references"] == [], "invalid Python produces no guessed references")
+
+    mixed = analyzer.analyze(
+        {
+            "files": [
+                {"path": "src/app.py", "content": "def local():\n    other()\n"},
+                {"path": "src/other.py", "content": "def other():\n    return 1\n"},
+                {"path": "config.json", "content": '{"token": "json-secret-value"}'},
+                {"path": "values.yaml", "content": "password: yaml-secret-value\n"},
+                {"path": "app.js", "content": "function other() { return 1; }\n"},
+            ]
+        }
+    )
+    check({row["path"] for row in mixed["files"]} == {"src/app.py", "src/other.py"},
+          "only Python files are parsed")
+    unsupported = {row["path"]: row["reason"] for row in mixed["unparsed"]}
+    check(unsupported.get("config.json") == "unsupported", "JSON is unsupported")
+    check(unsupported.get("values.yaml") == "unsupported", "YAML is unsupported")
+    check(unsupported.get("app.js") == "unsupported", "non-Python languages are unsupported")
+    cross = _refs(mixed["references"], "call", to="other", frm="src/app.py::local")
+    check(len(cross) == 1 and cross[0]["certainty"] == "unresolved",
+          "same-name other file is not guessed as exact")
+
+    secrets = {
+        "literal": "super-secret-password-xyz",
+        "default": "sk-live-secret-value",
+        "decorator": "decorator-secret-xyz",
+        "argument": "argument-secret-xyz",
+    }
+    secret_src = (
+        f'PASSWORD = "{secrets["literal"]}"\n'
+        f'def connect(token="{secrets["default"]}"):\n'
+        f'    @retry(api_key="{secrets["decorator"]}")\n'
+        f"    def inner():\n"
+        f'        call("{secrets["argument"]}")\n'
+    )
+    secret_out = analyzer.analyze({"files": [{"path": "leaky.py", "content": secret_src}]})
+    serialized = json.dumps(secret_out)
+    for name, value in secrets.items():
+        check(value not in serialized, f"analyzer output omits {name} secret")
+    check("PASSWORD" not in serialized and "token=" not in serialized, "analyzer omits source assignments")
+    leaky = secret_out["files"][0]
+    connect = _find(leaky["functions"], "connect")
+    check(connect is not None and connect["parameters"] == ["token"], "secret default is dropped; name remains")
+    inner = _find(leaky["functions"], "inner")
+    check(inner is not None and inner["decorators"] == ["retry"], "decorator arguments are omitted")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "analyzer-repo"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "app.py").write_text(ANALYZER_FIXTURE, encoding="utf-8")
+        (root / "notes.json").write_text('{"password": "dump-json-secret"}\n', encoding="utf-8")
+        dump = collector.collect(str(root))
+        from_dump = analyzer.analyze({"dump": dump})
+        check(from_dump["schemaVersion"] == "1", "dump input uses schemaVersion 1")
+        check(any(row["path"] == "src/app.py" for row in from_dump["files"]),
+              "sanitized dump FILE sections are analyzed")
+        check(any(row["path"] == "notes.json" and row["reason"] == "unsupported" for row in from_dump["unparsed"]),
+              "non-Python dump files are reported unsupported")
+        check("dump-json-secret" not in json.dumps(from_dump), "collector-redacted JSON secrets stay out of analyzer output")
+        check(from_dump["files"][0]["classes"], "dump-derived Python facts are present")
+
+    try:
+        analyzer.analyze({"repository": "https://github.com/example/repo"})
+        check(False, "repository URL without sanitized content is rejected")
+    except analyzer.AnalyzerError:
+        check(True, "repository URL without sanitized content is rejected")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), analyzer_server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+            check(response.status == 200 and response.read().decode("utf-8") == "ok", "GET /health returns ok")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps({"files": [{"path": "src/app.py", "content": ANALYZER_FIXTURE}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            status = response.status
+        check(status == 200, "POST /analyze returns 200")
+        check(payload["language"] == "python" and payload["files"], "POST /analyze returns analysis JSON")
+        bad = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps({"repository": "https://github.com/example/repo"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            check(False, "HTTP /analyze rejects a repository URL")
+        except urllib.error.HTTPError as exc:
+            check(exc.code == 400, "HTTP /analyze rejects a repository URL")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_analyzer_cross_file() -> None:
+    print("\nAST cross-file references")
+    analyzer, _ = _analyzer_modules()
+
+    files = [
+        {
+            "path": "src/util.py",
+            "content": (
+                "def helper(item):\n"
+                "    return item\n"
+                "\n"
+                "class Base:\n"
+                "    def ready(self):\n"
+                "        helper(self)\n"
+                "\n"
+                "def decorate(fn):\n"
+                "    return fn\n"
+            ),
+        },
+        {
+            "path": "src/worker.py",
+            "content": (
+                "from src.util import helper, Base, decorate\n"
+                "from src.util import helper as run_helper\n"
+                "import src.util\n"
+                "import src.util as utilmod\n"
+                "\n"
+                "@decorate\n"
+                "class Worker(Base):\n"
+                "    def run(self, item):\n"
+                "        helper(item)\n"
+                "        run_helper(item)\n"
+                "        src.util.helper(item)\n"
+                "        utilmod.helper(item)\n"
+                "        Worker()\n"
+                "        Base.ready(self)\n"
+                "\n"
+                "class Child(src.util.Base):\n"
+                "    pass\n"
+            ),
+        },
+        {
+            "path": "src/untied.py",
+            "content": "def local():\n    helper()\n",
+        },
+        {
+            "path": "a.py",
+            "content": "def process():\n    return 1\n",
+        },
+        {
+            "path": "b.py",
+            "content": "def process():\n    return 2\n",
+        },
+        {
+            "path": "shadow.py",
+            "content": (
+                "from a import process\n"
+                "from b import process\n"
+                "\n"
+                "def use():\n"
+                "    process()\n"
+            ),
+        },
+        {
+            "path": "unique_star.py",
+            "content": "def only_here():\n    return 1\n",
+        },
+        {
+            "path": "star_user.py",
+            "content": "from unique_star import *\n\ndef use():\n    only_here()\n",
+        },
+        {
+            "path": "star_ambiguous.py",
+            "content": (
+                "from a import *\n"
+                "from b import *\n"
+                "\n"
+                "def use():\n"
+                "    process()\n"
+            ),
+        },
+        {
+            "path": "dynamic.py",
+            "content": (
+                "import src.util as utilmod\n"
+                "\n"
+                "def use(name):\n"
+                "    getattr(utilmod, name)()\n"
+                "    eval('helper')\n"
+                "    __import__('src.util')\n"
+            ),
+        },
+    ]
+    result = analyzer.analyze({"files": files})
+    check(result == analyzer.analyze({"files": files}), "cross-file analysis is deterministic")
+    refs = result["references"]
+
+    helper_from = _refs(refs, "import", to="src/util.py::helper", frm="src/worker.py")
+    check(len(helper_from) == 2 and all(row["certainty"] == "exact" for row in helper_from),
+          "from-import and alias import resolve to the unique function")
+    check(_refs(refs, "import", to="src/util.py", frm="src/worker.py")
+          and all(row["certainty"] == "exact" for row in _refs(refs, "import", to="src/util.py", frm="src/worker.py")),
+          "import module and module alias resolve to the unique file")
+
+    worker_run = "src/worker.py::Worker.run"
+    for label, target in (
+        ("from-import call", "src/util.py::helper"),
+        ("import alias call", "src/util.py::helper"),
+    ):
+        found = _refs(refs, "call", to=target, frm=worker_run)
+        check(any(row["certainty"] == "exact" for row in found), f"{label} is exact")
+    helper_calls = _refs(refs, "call", to="src/util.py::helper", frm=worker_run)
+    check(len(helper_calls) == 4 and all(row["certainty"] == "exact" for row in helper_calls),
+          "from-import, alias, module.function, and module-alias.function resolve")
+    same_file_ctor = _refs(refs, "call", to="src/worker.py::Worker", frm=worker_run)
+    check(len(same_file_ctor) == 1 and same_file_ctor[0]["certainty"] == "exact",
+          "same-file class reference stays exact")
+    imported_method = _refs(refs, "call", to="src/util.py::Base.ready", frm=worker_run)
+    check(len(imported_method) == 1 and imported_method[0]["certainty"] == "exact",
+          "cross-file class method reference is exact")
+
+    inherit_base = _refs(refs, "inherit", to="src/util.py::Base", frm="src/worker.py::Worker")
+    check(len(inherit_base) == 1 and inherit_base[0]["certainty"] == "exact",
+          "cross-file inheritance from imported class is exact")
+    inherit_dotted = _refs(refs, "inherit", to="src/util.py::Base", frm="src/worker.py::Child")
+    check(len(inherit_dotted) == 1 and inherit_dotted[0]["certainty"] == "exact",
+          "cross-file inheritance via module.Class is exact")
+    decorate = _refs(refs, "decorate", to="src/util.py::decorate", frm="src/worker.py::Worker")
+    check(len(decorate) == 1 and decorate[0]["certainty"] == "exact",
+          "cross-file decorator reference is exact")
+
+    untied = _refs(refs, "call", to="helper", frm="src/untied.py::local")
+    check(len(untied) == 1 and untied[0]["certainty"] == "unresolved",
+          "same-name other file is not guessed without an import")
+    shadow = _refs(refs, "call", to="process", frm="shadow.py::use")
+    check(len(shadow) == 1 and shadow[0]["certainty"] == "unresolved",
+          "ambiguous imported symbols stay unresolved")
+    star_ok = _refs(refs, "call", to="unique_star.py::only_here", frm="star_user.py::use")
+    check(len(star_ok) == 1 and star_ok[0]["certainty"] == "exact",
+          "unique wildcard import resolves")
+    star_bad = _refs(refs, "call", to="process", frm="star_ambiguous.py::use")
+    check(len(star_bad) == 1 and star_bad[0]["certainty"] == "unresolved",
+          "ambiguous wildcard imports stay unresolved")
+
+    dynamic_calls = [row for row in refs if row["from"] == "dynamic.py::use" and row["kind"] == "call"]
+    check(dynamic_calls and all(row["certainty"] == "unresolved" for row in dynamic_calls),
+          "getattr/eval/__import__ stay unresolved")
+    exact = [row for row in refs if row["certainty"] == "exact"]
+    check(exact and all("::" in row["to"] or row["to"].endswith(".py") for row in exact),
+          "exact targets use deterministic qualified names")
+
+    secrets = {"hidden": "cross-file-secret-value-xyz"}
+    secret_files = [
+        {"path": "hold.py", "content": f'def leak(token="{secrets["hidden"]}"):\n    return token\n'},
+        {"path": "use.py", "content": "from hold import leak\n\ndef run():\n    leak()\n"},
+    ]
+    secret_out = analyzer.analyze({"files": secret_files})
+    check(secrets["hidden"] not in json.dumps(secret_out),
+          "cross-file resolution does not emit sensitive values")
+    leak_call = _refs(secret_out["references"], "call", to="hold.py::leak", frm="use.py::run")
+    check(len(leak_call) == 1 and leak_call[0]["certainty"] == "exact",
+          "resolved call still omits parameter defaults")
+
+
+def _map_modules():
+    import importlib
+    import importlib.util
+
+    map_dir = ROOT / "tools" / "repository-map"
+    map_path = str(map_dir)
+    if map_path not in sys.path:
+        sys.path.insert(0, map_path)
+    mapper = importlib.import_module("mapper")
+    server_name = "repository_map_server"
+    if server_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(server_name, map_dir / "server.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[server_name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return mapper, sys.modules[server_name]
+
+
+def _tree_child(tree: dict, *names: str) -> dict | None:
+    current = tree
+    for name in names:
+        kids = current.get("children") or []
+        current = next((child for child in kids if child.get("name") == name), None)
+        if current is None:
+            return None
+    return current
+
+
+def test_repository_map() -> None:
+    print("\nrepository map")
+    analyzer, _ = _analyzer_modules()
+    mapper, map_server = _map_modules()
+
+    src = (ROOT / "tools" / "repository-map" / "mapper.py").read_text(encoding="utf-8")
+    server_src = (ROOT / "tools" / "repository-map" / "server.py").read_text(encoding="utf-8")
+    check("import ast" not in src and "analyze_repository" not in src,
+          "mapper does not parse AST or resolve references")
+    check("import collector" not in src and "collect_into" not in src,
+          "mapper does not read collector entries")
+    check("import ast" not in server_src, "map server does not parse AST")
+
+    analysis = analyzer.analyze(
+        {
+            "files": [
+                {
+                    "path": "src/util.py",
+                    "content": (
+                        "def helper(item):\n"
+                        "    return item\n"
+                        "\n"
+                        "class Base:\n"
+                        "    pass\n"
+                        "\n"
+                        "def decorate(fn):\n"
+                        "    return fn\n"
+                    ),
+                },
+                {
+                    "path": "src/worker.py",
+                    "content": (
+                        "from src.util import helper, Base, decorate\n"
+                        "\n"
+                        "@decorate\n"
+                        "class Worker(Base):\n"
+                        "    def run(self, item):\n"
+                        "        helper(item)\n"
+                        "        unknown()\n"
+                    ),
+                },
+                {
+                    "path": "pkg/__init__.py",
+                    "content": "VALUE = 1\n",
+                },
+                {
+                    "path": "pkg/sub/mod.py",
+                    "content": "def local():\n    return 1\n",
+                },
+                {
+                    "path": "tests/test_app.py",
+                    "content": "def test_ok():\n    assert True\n",
+                },
+                {"path": "broken.py", "content": "def broken(\n"},
+                {"path": "config.json", "content": '{"token": "map-json-secret"}\n'},
+                {"path": "values.yaml", "content": "password: map-yaml-secret\n"},
+            ]
+        }
+    )
+    first = mapper.build({"analysis": analysis})
+    second = mapper.build({"analysisJson": json.dumps(analysis)})
+    check(first == second, "repository map is deterministic")
+    check(first["schemaVersion"] == "1", "map schemaVersion is 1")
+
+    modules = {row["path"]: row for row in first["modules"]}
+    check(modules["src/util.py"]["status"] == "parsed" and modules["src/util.py"]["language"] == "python",
+          "parsed Python modules are recorded")
+    check(modules["broken.py"]["status"] == "unparsed" and modules["broken.py"]["reason"] == "SyntaxError",
+          "invalid Python is unparsed in the map")
+    check(modules["config.json"]["status"] == "unparsed" and modules["config.json"]["reason"] == "unsupported",
+          "unsupported files are unparsed in the map")
+    check(modules["values.yaml"]["status"] == "unparsed", "YAML is unparsed, not analyzed")
+    check("src" in {row["path"] for row in first["directories"]}, "directories include src")
+    check(any(row["path"] == "pkg" and row["kind"] == "package" for row in first["directories"]),
+          "__init__.py directories are packages")
+    check(any(row["path"] == "pkg/sub" and row["kind"] == "directory" for row in first["directories"]),
+          "nested directories without __init__.py stay directories")
+    check(any(row["path"] == "tests" for row in first["directories"]),
+          "multiple top-level directories are mapped")
+
+    tree = first["tree"]
+    check(tree["kind"] == "directory", "tree root is a directory")
+    src_dir = _tree_child(tree, "src")
+    util = _tree_child(tree, "src", "util.py")
+    pkg_sub = _tree_child(tree, "pkg", "sub", "mod.py")
+    tests_mod = _tree_child(tree, "tests", "test_app.py")
+    check(src_dir is not None and src_dir["kind"] == "directory", "tree contains the src directory")
+    check(util is not None and util["status"] == "parsed" and util["path"] == "src/util.py",
+          "tree contains parsed modules")
+    check(pkg_sub is not None and pkg_sub["path"] == "pkg/sub/mod.py", "tree contains nested modules")
+    check(tests_mod is not None, "tree contains a second top-level directory")
+    broken = _tree_child(tree, "broken.py")
+    check(broken is not None and broken["status"] == "unparsed", "tree includes unparsed files")
+
+    symbols = {row["qualname"]: row for row in first["symbols"]}
+    check(symbols.get("src/util.py::Base", {}).get("kind") == "class", "map includes classes")
+    check(symbols.get("src/util.py::helper", {}).get("kind") == "function", "map includes functions")
+    check(symbols.get("src/worker.py::Worker.run", {}).get("kind") == "method", "map includes methods")
+    check("src/worker.py::Worker" in symbols, "qualified names are preserved")
+
+    rels = first["relationships"]
+    imports = _refs(rels, "import", to="src/util.py::helper", frm="src/worker.py")
+    check(imports and imports[0]["certainty"] == "exact", "map keeps resolved imports")
+    inherit = _refs(rels, "inherit", to="src/util.py::Base", frm="src/worker.py::Worker")
+    check(inherit and inherit[0]["certainty"] == "exact", "map keeps inheritance")
+    decorate = _refs(rels, "decorate", to="src/util.py::decorate", frm="src/worker.py::Worker")
+    check(decorate and decorate[0]["certainty"] == "exact", "map keeps decorators")
+    resolved_call = _refs(rels, "call", to="src/util.py::helper", frm="src/worker.py::Worker.run")
+    check(resolved_call and resolved_call[0]["certainty"] == "exact", "map keeps resolved calls")
+    unresolved_call = _refs(rels, "call", to="unknown", frm="src/worker.py::Worker.run")
+    check(unresolved_call and unresolved_call[0]["certainty"] == "unresolved",
+          "map preserves unresolved references")
+
+    module_rels = first["moduleRelationships"]
+    worker_util = next((row for row in module_rels if row["from"] == "src/worker.py" and row["to"] == "src/util.py"), None)
+    check(worker_util is not None and worker_util["certainty"] == "exact",
+          "exact cross-file refs become module relationships")
+    check("import" in worker_util["kinds"] and "call" in worker_util["kinds"],
+          "module relationships list deterministic kinds only")
+    check(all(row["certainty"] == "exact" for row in module_rels),
+          "module relationships are not guessed from unresolved refs")
+
+    serialized = json.dumps(first)
+    check("map-json-secret" not in serialized and "map-yaml-secret" not in serialized,
+          "repository map omits unsupported-file secrets")
+    check("def helper" not in serialized and "return item" not in serialized,
+          "repository map omits source snippets")
+
+    secret_analysis = analyzer.analyze(
+        {
+            "files": [
+                {
+                    "path": "hold.py",
+                    "content": 'def leak(token="map-secret-default-xyz"):\n    return token\n',
+                },
+                {"path": "use.py", "content": "from hold import leak\n\ndef run():\n    leak()\n"},
+            ]
+        }
+    )
+    secret_map = mapper.build({"analysis": secret_analysis})
+    check("map-secret-default-xyz" not in json.dumps(secret_map),
+          "repository map omits sensitive parameter defaults")
+
+    try:
+        mapper.build({"repository": "https://github.com/example/repo"})
+        check(False, "map rejects a repository URL")
+    except mapper.MapError:
+        check(True, "map rejects a repository URL")
+    try:
+        mapper.build({"dump": "FILE: app.py\nprint(1)\n"})
+        check(False, "map rejects a collector dump")
+    except mapper.MapError:
+        check(True, "map rejects a collector dump")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), map_server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+            check(response.status == 200 and response.read().decode("utf-8") == "ok", "GET /health returns ok")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/map",
+            data=json.dumps({"analysis": analysis}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            status = response.status
+        check(status == 200 and payload == first, "POST /map returns the same map JSON")
+        bad = urllib.request.Request(
+            f"http://127.0.0.1:{port}/map",
+            data=json.dumps({"repository": "https://github.com/example/repo"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            check(False, "HTTP /map rejects a repository URL")
+        except urllib.error.HTTPError as exc:
+            check(exc.code == 400, "HTTP /map rejects a repository URL")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_pipeline_config() -> None:
     print("\npipeline configuration")
     pipeline = (ROOT / "agents" / "repository-pipeline.yaml").read_text(encoding="utf-8")
@@ -1211,6 +1847,34 @@ def test_pipeline_config() -> None:
     check("sanitize(" in collector_src, "collector dump is regex-sanitized before it is returned")
     check("sanitize_structured(" in collector_src, "collector dump is structured-field sanitized before regex")
     check("apply_local_llm_detections" in collector_src, "optional Local LLM is a post-pass after deterministic sanitization")
+    analyzer_tool = (ROOT / "tools" / "repository-analyzer.yaml").read_text(encoding="utf-8")
+    check("type: http" in analyzer_tool, "analyzer Tool is HTTP")
+    check("/analyze" in analyzer_tool, "analyzer Tool posts to /analyze")
+    check("repository" not in analyzer_tool.split("inputSchema:", 1)[1].split("http:", 1)[0],
+          "analyzer Tool does not accept a repository URL")
+    check(
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-analyzer", docs) is not None,
+        "documentation Agent references the repository-analyzer",
+    )
+    check("repository-analyzer" not in tools_block, "pipeline Agent does not call the analyzer")
+    check("repository-map" not in tools_block, "pipeline Agent does not call the repository map")
+    check("Do not call repository-collector, repository-analyzer, or repository-map" in pipeline,
+          "pipeline prompt keeps collection, analysis, and mapping off the orchestrator")
+    check("repository-analyzer" in values, "Helm values configure the analyzer")
+    check("component: analyzer" in (ROOT / "templates" / "repository-analyzer.yaml").read_text(encoding="utf-8"),
+          "analyzer Deployment/Service template exists")
+    map_tool = (ROOT / "tools" / "repository-map.yaml").read_text(encoding="utf-8")
+    check("type: http" in map_tool and "/map" in map_tool, "map Tool posts to /map")
+    map_schema = map_tool.split("inputSchema:", 1)[1].split("http:", 1)[0]
+    check("analysisJson:" in map_schema and "repository:" not in map_schema,
+          "map Tool does not accept a repository URL")
+    check(
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-map", docs) is not None,
+        "documentation Agent references the repository-map",
+    )
+    check("repository-map" in values, "Helm values configure the repository map")
+    check("component: mapper" in (ROOT / "templates" / "repository-map.yaml").read_text(encoding="utf-8"),
+          "map Deployment/Service template exists")
 
 
 def renderer_artifact(filename: str) -> str | None:
@@ -1323,6 +1987,9 @@ def main() -> int:
     test_git_errors()
     test_gitlab_auth_abstraction()
     test_renderer_unit()
+    test_analyzer()
+    test_analyzer_cross_file()
+    test_repository_map()
     test_pipeline_config()
     if "--network" in sys.argv:
         test_live_clone()
