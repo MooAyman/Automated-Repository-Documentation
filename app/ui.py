@@ -264,12 +264,7 @@ def _run_pipeline(url: str, ref: str) -> None:
             label = f"Generating documentation… ({phase})"
         progress.markdown(f'<p class="aman-progress">{label}</p>', unsafe_allow_html=True)
 
-    def run_pipeline(_plan: dict) -> dict:
-        _plan = dict(_plan)
-        _plan["ref"] = ref
-        return ark_client.run_ark_pipeline(_plan, on_phase=on_phase)
-
-    result = ark_client.execute_documentation_plan(plan, run_pipeline=run_pipeline)
+    result = ark_client.document_repository(url, ref, on_phase=on_phase)
     progress.empty()
     if result["status"] == "failed":
         st.session_state["error"] = result.get("error") or "Pipeline failed"

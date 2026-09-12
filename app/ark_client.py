@@ -7,8 +7,8 @@ collector). Analysis and map updates run on the host from SHA-tied
 sidecars when the sidecar commit matches previousCommit. It then Queries
 the full or incremental documentation Agent and persists HTML with the
 renderer module. It does not ask an LLM to copy documentation JSON into
-the renderer Tool. Agent/repository-pipeline remains available for CLI
-``ark query``.
+the renderer Tool. Agent/repository-pipeline remains available for raw
+operator ``ark query``; the host CLI uses this planner instead.
 """
 
 from __future__ import annotations
@@ -311,6 +311,30 @@ def execute_documentation_plan(
     if isinstance(outcome.get("repositoryMap"), dict):
         documented["repositoryMap"] = outcome["repositoryMap"]
     return documented
+
+
+def document_repository(
+    repository_url: str,
+    ref: str = "",
+    *,
+    current_sha: str = "",
+    registry_path: str | Path | None = None,
+    run_pipeline: Callable[[dict], dict] | None = None,
+    on_phase: Callable[[str | None], None] | None = None,
+) -> dict:
+    """Plan and execute documentation. Same path as Streamlit and the webhook."""
+    url, ref = validate_pipeline_input(repository_url, ref)
+    plan = plan_documentation(
+        url,
+        ref,
+        current_sha=current_sha,
+        registry_path=registry_path,
+    )
+    plan = dict(plan)
+    plan["ref"] = ref
+    if run_pipeline is None:
+        run_pipeline = lambda documented_plan: run_ark_pipeline(documented_plan, on_phase=on_phase)
+    return execute_documentation_plan(plan, run_pipeline=run_pipeline, registry_path=registry_path)
 
 
 def _load_renderer_file(modname: str, filename: str):

@@ -2046,7 +2046,7 @@ def test_commit_pinning_and_eligibility() -> None:
 
     ui_src = (ROOT / "app" / "ui.py").read_text(encoding="utf-8")
     ark_src = Path(ark_client.__file__).read_text(encoding="utf-8")
-    check("run_ark_pipeline" in ui_src, "Streamlit forwards registry SHAs through the existing Query runner")
+    check("document_repository" in ui_src, "Streamlit uses the shared host documentation planner")
     check("previous_commit=" in ark_src and "new_commit=" in ark_src,
           "Query input still carries previousCommit and newCommit")
 
@@ -4350,8 +4350,9 @@ def test_webhook_automation() -> None:
 
     webhook.reset_triggers()
     src = Path(webhook.__file__).read_text(encoding="utf-8")
-    check(webhook.webhook_enabled(), "webhook listener is enabled by default")
     previous_enabled = os.environ.get("WEBHOOK_ENABLED")
+    os.environ.pop("WEBHOOK_ENABLED", None)
+    check(webhook.webhook_enabled(), "webhook listener is enabled by default")
     os.environ["WEBHOOK_ENABLED"] = "false"
     try:
         check(not webhook.webhook_enabled() and webhook.ensure_started() is None,
@@ -4513,6 +4514,177 @@ def test_webhook_automation() -> None:
     webhook.reset_triggers()
 
 
+def test_cli_planner() -> None:
+    print("\nhost CLI shares the documentation planner")
+    _validation, ark_client, registry = _host_modules()
+    app_dir = str(ROOT / "app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+    import cli  # noqa: E402
+
+    url, ref = cli.parse_request(["https://github.com/MooAyman/github-mcp-chatbot"], "main")
+    check(url == "https://github.com/MooAyman/github-mcp-chatbot" and ref == "main",
+          "CLI accepts URL plus --ref")
+    sentence_url, sentence_ref = cli.parse_request(
+        ["Document this repository: https://github.com/MooAyman/github-mcp-chatbot ref: develop"]
+    )
+    check(
+        sentence_url == "https://github.com/MooAyman/github-mcp-chatbot" and sentence_ref == "develop",
+        "CLI parses the Document-this-repository sentence",
+    )
+    try:
+        cli.parse_request(["not-a-url"])
+        check(False, "CLI rejects a missing repository URL")
+    except Exception as exc:
+        check("repository url" in str(exc).lower(), "CLI rejects a missing repository URL")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "cli-registry.json"
+        sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sha2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        docs = _sample_docs(util="src/util.py", unrelated="src/unrelated.py")
+        called: list[str] = []
+
+        def fake_pipeline(plan: dict) -> dict:
+            called.append(str(plan.get("mode") or ""))
+            if plan.get("mode") == "full":
+                return {"ok": True, "artifact": "github-mcp-chatbot.html", "documentation": docs}
+            return {
+                "ok": True,
+                "artifact": "github-mcp-chatbot.html",
+                "documentation": docs,
+                "impact": {"mode": "incremental", "updateFields": ["coreConceptsAndArchitecture.summary"]},
+            }
+
+        first = cli.run(url, run_pipeline=fake_pipeline, registry_path=path, current_sha=sha1)
+        check(first.get("status") == "documented" and first.get("mode") == "full",
+              "CLI first run is full generation")
+        check(called == ["full"], "CLI first run executes the pipeline once")
+        check(registry.lookup(url, path)["commitSha"] == sha1, "CLI first success writes the registry SHA")
+
+        failed = cli.run(url, run_pipeline=lambda _plan: {"ok": False, "error": "forced"},
+                         registry_path=path, current_sha=sha2)
+        check(failed.get("status") == "failed", "CLI failed run is reported as failed")
+        check(registry.lookup(url, path)["commitSha"] == sha1,
+              "CLI failed run does not update the registry SHA")
+
+        updated = cli.run(url, run_pipeline=fake_pipeline, registry_path=path, current_sha=sha2)
+        check(updated.get("status") == "documented" and updated.get("mode") == "incremental",
+              "CLI new SHA is incremental")
+        check(registry.lookup(url, path)["commitSha"] == sha2, "CLI incremental success updates the SHA")
+
+        skipped = cli.run(url, run_pipeline=fake_pipeline, registry_path=path, current_sha=sha2)
+        check(skipped.get("status") == "already_documented", "CLI same SHA skips generation")
+        check(called == ["full", "incremental"], "CLI same SHA does not run the pipeline")
+
+        original_resolve = ark_client.resolve_commit_sha
+        ark_client.resolve_commit_sha = lambda _url, _ref="": sha2
+        try:
+            code = cli.main(
+                [url, "--registry", str(path)],
+                run_pipeline=lambda _plan: {"ok": False, "error": "should-not-run"},
+            )
+        finally:
+            ark_client.resolve_commit_sha = original_resolve
+        check(code == 0, "CLI main exits 0 on already_documented")
+
+    cli_src = (ROOT / "app" / "cli.py").read_text(encoding="utf-8")
+    check("document_repository" in cli_src, "CLI calls document_repository")
+    check("PIPELINE_AGENT" not in cli_src, "CLI does not Query the raw pipeline Agent")
+
+
+def _remote_parent_sha(url: str, sha: str) -> str:
+    parts = url.rstrip("/").split("/")
+    owner, name = parts[-2], parts[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{name}/commits/{sha}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "repository-documentation-e2e",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return ""
+    parents = payload.get("parents") if isinstance(payload, dict) else None
+    if not isinstance(parents, list) or not parents:
+        return ""
+    return str((parents[0] or {}).get("sha") or "")
+
+
+def test_cli_documentation_e2e() -> None:
+    """Live CLI planner: first=full, new SHA=incremental, same SHA=skip, fail leaves registry."""
+    print("\nCLI documentation e2e")
+    _validation, ark_client, registry = _host_modules()
+    app_dir = str(ROOT / "app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+    import cli  # noqa: E402
+
+    tmp = tempfile.mkdtemp(prefix="e2e-cli-reg-")
+    reg = Path(tmp) / "cli-registry.json"
+
+    first = cli.run(TARGET_REPO, registry_path=reg)
+    check(
+        first.get("status") == "documented" and first.get("mode") == "full",
+        f"CLI first run is full (status={first.get('status')} mode={first.get('mode')})",
+    )
+    if first.get("status") != "documented":
+        print(f"  info  error: {first.get('error')}")
+        return
+    current = str(first.get("currentCommit") or "")
+    check(bool(current), "CLI first run records the documented SHA")
+    check(registry.lookup(TARGET_REPO, reg)["commitSha"] == current,
+          "CLI first success writes the registry SHA")
+    print(f"  info  CLI full SHA {current}")
+
+    parent = _remote_parent_sha(TARGET_REPO, current)
+    check(bool(parent) and parent != current, "CLI e2e has a parent SHA for incremental")
+    if not parent or parent == current:
+        return
+    stored = registry.lookup(TARGET_REPO, reg) or {}
+    registry.record_success(
+        TARGET_REPO,
+        parent,
+        artifact=str(stored.get("artifact") or first.get("artifact") or ""),
+        documentation=stored.get("documentation") if isinstance(stored.get("documentation"), dict) else None,
+        path=reg,
+    )
+    check(registry.lookup(TARGET_REPO, reg)["commitSha"] == parent,
+          "CLI e2e seeds the parent SHA before incremental")
+
+    updated = cli.run(TARGET_REPO, registry_path=reg, current_sha=current)
+    check(
+        updated.get("status") == "documented" and updated.get("mode") == "incremental",
+        f"CLI new SHA is incremental (status={updated.get('status')} mode={updated.get('mode')})",
+    )
+    if updated.get("status") != "documented":
+        print(f"  info  incremental error: {updated.get('error')}")
+        return
+    check(registry.lookup(TARGET_REPO, reg)["commitSha"] == current,
+          "CLI incremental success updates the registry SHA")
+    print(f"  info  CLI incremental previous={parent} current={current}")
+
+    skipped = cli.run(TARGET_REPO, registry_path=reg, current_sha=current)
+    check(skipped.get("status") == "already_documented", "CLI same SHA skips generation")
+    check(registry.lookup(TARGET_REPO, reg)["commitSha"] == current,
+          "CLI same SHA leaves the registry SHA unchanged")
+
+    failed = cli.run(
+        TARGET_REPO,
+        registry_path=reg,
+        current_sha="ffffffffffffffffffffffffffffffffffffffff",
+        run_pipeline=lambda _plan: {"ok": False, "error": "forced-cli-e2e"},
+    )
+    check(failed.get("status") == "failed", "CLI failed run is reported as failed")
+    check(registry.lookup(TARGET_REPO, reg)["commitSha"] == current,
+          "CLI failed run does not update the registry SHA")
+
+
 def test_pipeline_config() -> None:
     pipeline = (ROOT / "agents" / "repository-pipeline.yaml").read_text(encoding="utf-8")
     docs = (ROOT / "agents" / "repository-documentation.yaml").read_text(encoding="utf-8")
@@ -4521,6 +4693,8 @@ def test_pipeline_config() -> None:
     collector_tool = (ROOT / "tools" / "repository-collector.yaml").read_text(encoding="utf-8")
 
     check("name: repository-pipeline" in pipeline, "pipeline Agent exists")
+    check("documentation-registry" not in pipeline,
+          "raw pipeline Agent does not consult the host registry")
     check(
         re.search(r"type:\s*agent\s*\n\s*name:\s*repository-documentation", pipeline) is not None,
         "pipeline Agent references the documentation Agent as an Agent Tool",
@@ -4637,7 +4811,7 @@ def test_pipeline_config() -> None:
     check("session_state" not in registry_src and "session_state" not in ark_client_src,
           "documented SHA is not stored only in Streamlit memory")
     check("already_documented" in ark_client_src, "ark_client returns already_documented for the same SHA")
-    check("plan_documentation" in ui_src and "execute_documentation_plan" in ui_src,
+    check("plan_documentation" in ui_src and "document_repository" in ui_src,
           "Streamlit consults the registry before applying a Query")
     check("previousCommit" in pipeline and "newCommit" in pipeline,
           "pipeline Agent forwards supplied previousCommit and newCommit")
@@ -4764,6 +4938,12 @@ def test_pipeline_config() -> None:
     check('os.environ.get("WEBHOOK_ENABLED", "true")' in (ROOT / "app" / "webhook.py").read_text(
         encoding="utf-8"
     ), "webhook listener defaults on when Streamlit starts")
+    check("def document_repository" in ark_client_src,
+          "host CLI/UI/webhook share document_repository")
+    check("document_repository" in (ROOT / "app" / "webhook.py").read_text(encoding="utf-8"),
+          "webhook uses the shared host documentation planner")
+    check("document_repository" in (ROOT / "app" / "cli.py").read_text(encoding="utf-8"),
+          "CLI uses the shared host documentation planner")
     check("run_ark_pipeline" in ark_client_src and "run_ark_pipeline" in (ROOT / "app" / "webhook.py").read_text(
         encoding="utf-8"
     ), "webhook reuses the existing ARK Query pipeline")
@@ -5350,6 +5530,7 @@ def main() -> int:
     test_incremental_documentation()
     test_incremental_context_optimization()
     test_webhook_automation()
+    test_cli_planner()
     test_pipeline_config()
     if "--network" in sys.argv:
         test_live_clone()
@@ -5358,6 +5539,7 @@ def main() -> int:
     test_optional_gitlab_e2e()
     if "--e2e" in sys.argv:
         test_pipeline_e2e()
+        test_cli_documentation_e2e()
         test_self_repo_incremental_e2e()
     else:
         print("skipping deployed end-to-end test (pass --e2e to enable)")

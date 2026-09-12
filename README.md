@@ -47,12 +47,12 @@ Windows host
 
 Collector, analyzer, map, and renderer are Tools, not Agents: they are deterministic HTTP services. They must not invent files, rewrite documentation, or call a model. The analyzer accepts only already-sanitized content (never a clone). The map accepts only analyzer JSON. The documentation Agent owns analysis; the pipeline Agent only sequences documentation then render. ARK 0.1.68 treats an Agent's `outputSchema` as that Agent's final response, so the documentation Agent cannot call the renderer in the same turn. The pipeline Agent calls the documentation Agent as an Agent Tool, then calls the renderer.
 
-The Streamlit app does not call the collector, analyzer, map, or renderer. It validates the URL and optional ref, then submits the same Query the CLI uses unless that repository is already documented at the current commit. The last documented SHA is stored in `state/documentation-registry.json` (not Streamlit memory and not the HTML file). A raw `ark query` CLI run does not consult this registry.
+The Streamlit app, webhook, and host CLI (`python app/cli.py`) share `plan_documentation` / `document_repository`: they validate URL/ref, consult `state/documentation-registry.json`, skip the same SHA, and run full or incremental generation. A raw `ark query agent/repository-pipeline` does not consult this registry.
 
 ## Features
 
-- One-command ARK pipeline (`ark query agent/repository-pipeline …`)
-- Streamlit UI that validates the URL/ref, then submits that same Query and reads the HTML from `out/`
+- Host CLI (`python app/cli.py <url>`) that uses the same planner as Streamlit and the webhook
+- Streamlit UI that validates the URL/ref, then submits that same planned Query and reads the HTML from `out/`
 - Persistent last-documented commit SHA per repository (JSON registry; SHA is written only after a successful generation)
 - Same repository + same SHA returns `already_documented` and skips regeneration
 - Deterministic URL and ref validation before a Query starts (no LLM)
@@ -174,15 +174,14 @@ The collector injects `GITLAB_TOKEN` from that Secret and authenticates with a h
 ### CLI
 
 ```powershell
-ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot"
+python app\cli.py https://github.com/MooAyman/github-mcp-chatbot
+python app\cli.py https://github.com/MooAyman/github-mcp-chatbot --ref develop
 ```
 
-That single Query runs `repository-pipeline` → `repository-documentation` → `repository-collector` → `repository-analyzer` → `repository-map` → `documentation-renderer` → HTML. You do not retrieve or paste the JSON. There is no standalone documentation Query.
-
-Optional ref (also accepted as `branch: …`):
+The host CLI uses the same planner as Streamlit and the webhook (registry SHA, full vs incremental, host merge). Raw operator use of ARK is unchanged:
 
 ```powershell
-ark query agent/repository-pipeline "Document this repository: https://gitlab.example.com/group/project ref: develop"
+ark query agent/repository-pipeline "Document this repository: https://github.com/MooAyman/github-mcp-chatbot"
 ```
 
 ### Streamlit UI
@@ -194,7 +193,7 @@ pip install -r app\requirements.txt
 python -m streamlit run app\ui.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. Invalid input is rejected before a Query is applied. The app applies one Query to `agent/repository-pipeline` (timeout 15m), waits for `done`, and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
+Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. Invalid input is rejected before a Query is applied. The app uses the same host planner as the CLI and webhook (skip same SHA, otherwise one full or incremental Agent Query, timeout 15m) and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
 
 The UI starts an in-process GitHub/GitLab push listener (`http://127.0.0.1:8787/webhook`) unless `WEBHOOK_ENABLED=0`. GitHub.com cannot deliver to localhost unless you expose that port.
 
@@ -382,7 +381,7 @@ out/                            Generated HTML (host bind; not a pipeline input)
 - Docker Desktop Kubernetes cannot mount a Windows directory as a pod `hostPath`; HTML reaches the host through the Docker bind above.
 - Local filesystem collection exists inside the collector container only. It is not a supported user-facing pipeline input.
 - The Streamlit UI requires a working `kubectl` context and a deployed chart; it is not an in-cluster service.
-- The last-documented SHA registry is host-side (`state/documentation-registry.json`). `ark query` from the CLI still always runs the full pipeline.
+- The last-documented SHA registry is host-side (`state/documentation-registry.json`). Raw `ark query agent/repository-pipeline` does not consult it; `python app/cli.py` does.
 - Streamlit starts an in-process push webhook on port 8787. GitHub/GitLab on the internet cannot reach `127.0.0.1`; register a reachable URL (tunnel or public host) on the repository. Set `WEBHOOK_ENABLED=0` to disable the listener.
 
 ## Future work

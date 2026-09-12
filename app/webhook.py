@@ -15,7 +15,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from ark_client import execute_documentation_plan, plan_documentation, run_ark_pipeline
+from ark_client import document_repository, run_ark_pipeline
 from validation import ValidationError, validate_commit_sha, validate_repository_url
 
 log = logging.getLogger("documentation-webhook")
@@ -149,29 +149,24 @@ def start_documentation(
     """Enqueue the existing documentation plan. Does not do the work here."""
 
     def _run() -> None:
-        plan = plan_documentation(
+        result = document_repository(
             event["repository"],
             event.get("ref") or "",
             current_sha=event["after"],
             registry_path=registry_path,
+            run_pipeline=run_pipeline or run_ark_pipeline,
         )
-        plan["ref"] = event.get("ref") or ""
         record = {
             "repository": event["repository"],
             "before": event.get("before") or "",
             "after": event["after"],
-            "previousCommit": plan.get("previousCommit") or "",
-            "currentCommit": plan.get("currentCommit") or "",
-            "status": plan.get("status"),
+            "previousCommit": result.get("previousCommit") or "",
+            "currentCommit": result.get("currentCommit") or "",
+            "status": result.get("status"),
+            "result": result.get("status"),
+            "documentationVersion": result.get("documentationVersion"),
         }
         _triggers.append(record)
-        if not plan.get("runPipeline"):
-            record["result"] = plan.get("status")
-            return
-        runner = run_pipeline or run_ark_pipeline
-        result = execute_documentation_plan(plan, run_pipeline=runner, registry_path=registry_path)
-        record["result"] = result.get("status")
-        record["documentationVersion"] = result.get("documentationVersion")
 
     thread = threading.Thread(target=_run, name="documentation-webhook", daemon=True)
     thread.start()
