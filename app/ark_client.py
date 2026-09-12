@@ -31,7 +31,13 @@ from documentation_registry import (
     repository_identity,
     same_commit,
 )
-from validation import ValidationError, validate_commit_sha, validate_pipeline_input
+from validation import (
+    ValidationError,
+    is_commit_sha,
+    is_full_commit_sha,
+    validate_commit_sha,
+    validate_pipeline_input,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "out"
@@ -101,21 +107,118 @@ def parse_ls_remote(stdout: str) -> str:
     return chosen[0]
 
 
+def _run_ls_remote(url: str, pattern: str) -> subprocess.CompletedProcess:
+    """``git ls-remote`` with the collector's GitLab host-scoped auth env."""
+    collector = _tool_modules()[3]
+    env = collector.build_git_env(url)
+    try:
+        return subprocess.run(
+            ["git", "ls-remote", "--", url, pattern],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=collector.clone_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        timed_out = subprocess.CompletedProcess(
+            args=exc.cmd or ["git", "ls-remote"],
+            returncode=124,
+            stdout="",
+            stderr="git ls-remote timed out",
+        )
+        return timed_out
+
+
+def probe_remote_ref(
+    repository_url: str,
+    ref: str = "",
+    *,
+    runner: Callable[[str, str], subprocess.CompletedProcess] | None = None,
+) -> dict:
+    """Classify remote ref existence without cloning.
+
+    Returns ``status`` of ``exists``, ``missing``, or ``unverified``.
+    Authentication, network, and repository-access failures are ``unverified``,
+    never ``missing``. SHA-shaped refs are not probed as branch/tag names.
+    """
+    url, ref = validate_pipeline_input(repository_url, ref)
+    if is_commit_sha(ref):
+        return {
+            "status": "unverified",
+            "sha": ref if is_full_commit_sha(ref) else "",
+            "ref": ref,
+            "error": "",
+        }
+    pattern = ref or "HEAD"
+    run = runner or _run_ls_remote
+    try:
+        result = run(url, pattern)
+    except Exception as exc:
+        return {
+            "status": "unverified",
+            "sha": "",
+            "ref": ref,
+            "error": str(exc) or "could not verify repository ref",
+        }
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if result.returncode == 0:
+        if stdout.strip():
+            try:
+                return {
+                    "status": "exists",
+                    "sha": parse_ls_remote(stdout),
+                    "ref": ref,
+                    "error": "",
+                }
+            except Exception as exc:
+                return {
+                    "status": "unverified",
+                    "sha": "",
+                    "ref": ref,
+                    "error": str(exc) or "could not parse ls-remote output",
+                }
+        if ref:
+            collector = _tool_modules()[3]
+            source = collector.redact(collector.strip_userinfo(url))
+            return {
+                "status": "missing",
+                "sha": "",
+                "ref": ref,
+                "error": f"Requested ref not found: '{ref}' does not exist in {source}",
+            }
+        return {
+            "status": "unverified",
+            "sha": "",
+            "ref": ref,
+            "error": "could not resolve the repository default branch",
+        }
+
+    collector = _tool_modules()[3]
+    classified = collector.classify_git_error(stderr or stdout, url, ref)
+    if classified.status == 404 and ref and str(classified).startswith("Requested ref not found"):
+        return {
+            "status": "missing",
+            "sha": "",
+            "ref": ref,
+            "error": str(classified),
+        }
+    return {
+        "status": "unverified",
+        "sha": "",
+        "ref": ref,
+        "error": str(classified) or "could not verify repository ref",
+    }
+
+
 def resolve_commit_sha(repository_url: str, ref: str = "") -> str:
     """Resolve the current remote commit without cloning the repository."""
-    url, ref = validate_pipeline_input(repository_url, ref)
-    args = ["git", "ls-remote", "--", url, ref or "HEAD"]
-    result = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"could not resolve commit SHA: {err}")
-    return parse_ls_remote(result.stdout)
+    probed = probe_remote_ref(repository_url, ref)
+    if probed.get("status") == "exists" and probed.get("sha"):
+        return str(probed["sha"])
+    raise RuntimeError(probed.get("error") or "could not resolve commit SHA")
 
 
 def documented_commit(repository_url: str, *, registry_path: str | Path | None = None) -> str:
@@ -128,12 +231,15 @@ def plan_documentation(
     ref: str = "",
     *,
     resolver: Callable[[str, str], str] | None = None,
+    probe: Callable[[str, str], dict] | None = None,
     registry_path: str | Path | None = None,
     current_sha: str = "",
 ) -> dict:
     """Decide whether to run the pipeline or return already_documented.
 
     Persistence lives in the JSON registry, not Streamlit memory or HTML.
+    Non-SHA refs that definitely do not exist raise ValidationError before
+    any Query. Access/auth failures do not count as an invalid ref.
     """
     url, ref = validate_pipeline_input(repository_url, ref)
     identity = repository_identity(url)
@@ -142,11 +248,23 @@ def plan_documentation(
     current = (current_sha or "").strip()
     if current:
         current = validate_commit_sha(current, required=True)
-    else:
-        resolve = resolver or resolve_commit_sha
+    elif is_full_commit_sha(ref):
+        current = validate_commit_sha(ref, required=True)
+    elif is_commit_sha(ref):
+        current = ""
+    elif resolver is not None:
         try:
-            current = resolve(url, ref)
+            current = resolver(url, ref)
         except Exception:
+            current = ""
+    else:
+        probed = (probe or probe_remote_ref)(url, ref)
+        status = str((probed or {}).get("status") or "")
+        if status == "missing":
+            raise ValidationError(str(probed.get("error") or f"Requested ref not found: '{ref}'"))
+        if status == "exists":
+            current = str(probed.get("sha") or "")
+        else:
             current = ""
 
     if stored and current and same_commit(previous, current):
@@ -321,15 +439,34 @@ def document_repository(
     registry_path: str | Path | None = None,
     run_pipeline: Callable[[dict], dict] | None = None,
     on_phase: Callable[[str | None], None] | None = None,
+    resolver: Callable[[str, str], str] | None = None,
+    probe: Callable[[str, str], dict] | None = None,
 ) -> dict:
     """Plan and execute documentation. Same path as Streamlit and the webhook."""
     url, ref = validate_pipeline_input(repository_url, ref)
-    plan = plan_documentation(
-        url,
-        ref,
-        current_sha=current_sha,
-        registry_path=registry_path,
-    )
+    try:
+        plan = plan_documentation(
+            url,
+            ref,
+            current_sha=current_sha,
+            resolver=resolver,
+            probe=probe,
+            registry_path=registry_path,
+        )
+    except ValidationError as exc:
+        stored = lookup(url, registry_path)
+        return {
+            "status": "failed",
+            "mode": "",
+            "repository": url,
+            "identity": repository_identity(url),
+            "currentCommit": "",
+            "previousCommit": str((stored or {}).get("commitSha") or ""),
+            "documentationVersion": int((stored or {}).get("documentationVersion") or 0),
+            "artifact": str((stored or {}).get("artifact") or ""),
+            "error": str(exc),
+            "runPipeline": False,
+        }
     plan = dict(plan)
     plan["ref"] = ref
     if run_pipeline is None:

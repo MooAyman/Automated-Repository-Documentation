@@ -1,7 +1,8 @@
 """Deterministic host-side validation of pipeline URL and ref.
 
-Runs before any ARK Query. Does not clone, resolve refs, or call a model.
-Local filesystem paths are not accepted as pipeline input.
+Runs before any ARK Query. Checks URL/ref syntax only. Branch/tag existence
+is resolved by ``ark_client`` before a Query starts. Does not clone or call
+a model. Local filesystem paths are not accepted as pipeline input.
 """
 
 from __future__ import annotations
@@ -87,6 +88,17 @@ def validate_repository_url(repository_url: str) -> str:
     return urlunsplit((scheme, _netloc(parts, host), rebuilt_path, "", ""))
 
 
+def is_commit_sha(value: str) -> bool:
+    """True when value is SHA-shaped (7–40 hex). Not a branch/tag existence check."""
+    return bool(_SHA_RE.match((value or "").strip()))
+
+
+def is_full_commit_sha(value: str) -> bool:
+    """True when value is a 40-character commit SHA."""
+    text = (value or "").strip()
+    return bool(text) and len(text) == 40 and is_commit_sha(text)
+
+
 def validate_commit_sha(value: str, *, required: bool = False) -> str:
     """Validate an optional documented commit SHA. Does not check existence."""
     text = (value or "").strip()
@@ -94,7 +106,7 @@ def validate_commit_sha(value: str, *, required: bool = False) -> str:
         if required:
             raise ValidationError("commit SHA is required")
         return ""
-    if not _SHA_RE.match(text):
+    if not is_commit_sha(text):
         raise ValidationError("commit SHA is invalid")
     return text
 
@@ -106,7 +118,7 @@ def validate_ref(ref: str) -> str:
         return ""
     if len(value) > MAX_REF_LENGTH:
         raise ValidationError("ref is too long")
-    if _SHA_RE.match(value):
+    if is_commit_sha(value):
         return value
     if value.startswith("-"):
         raise ValidationError("ref must not start with '-'")

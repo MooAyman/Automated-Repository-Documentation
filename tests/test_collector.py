@@ -979,6 +979,10 @@ def test_input_validation() -> None:
         check(False, "invalid commit SHA is rejected")
     except validation.ValidationError as exc:
         check("commit sha" in str(exc).lower(), "invalid commit SHA uses a ValidationError")
+    check(validation.is_commit_sha("abcdeff"), "short hex is treated as a SHA-shaped ref")
+    check(validation.is_full_commit_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+          "40-character hex is a full commit SHA")
+    check(not validation.is_commit_sha("develop"), "branch names are not SHA-shaped")
     _, missing = validation.validate_pipeline_input(TARGET_REPO, "this-ref-does-not-exist-xyz")
     check(missing == "this-ref-does-not-exist-xyz", "ref existence is not checked here")
     _, branch = validation.validate_pipeline_input(TARGET_REPO, "feature/better-docs")
@@ -4577,20 +4581,164 @@ def test_cli_planner() -> None:
         check(skipped.get("status") == "already_documented", "CLI same SHA skips generation")
         check(called == ["full", "incremental"], "CLI same SHA does not run the pipeline")
 
-        original_resolve = ark_client.resolve_commit_sha
-        ark_client.resolve_commit_sha = lambda _url, _ref="": sha2
+        original_probe = ark_client.probe_remote_ref
+        ark_client.probe_remote_ref = lambda _url, _ref="": {
+            "status": "exists",
+            "sha": sha2,
+            "ref": _ref,
+            "error": "",
+        }
         try:
             code = cli.main(
                 [url, "--registry", str(path)],
                 run_pipeline=lambda _plan: {"ok": False, "error": "should-not-run"},
             )
         finally:
-            ark_client.resolve_commit_sha = original_resolve
+            ark_client.probe_remote_ref = original_probe
         check(code == 0, "CLI main exits 0 on already_documented")
 
     cli_src = (ROOT / "app" / "cli.py").read_text(encoding="utf-8")
     check("document_repository" in cli_src, "CLI calls document_repository")
     check("PIPELINE_AGENT" not in cli_src, "CLI does not Query the raw pipeline Agent")
+
+
+def _ls_remote_result(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=["git", "ls-remote"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def test_ref_resolution() -> None:
+    print("\nrepository ref resolution")
+    validation, ark_client, registry = _host_modules()
+    url = "https://github.com/owner/repo"
+    sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    docs = _sample_docs(util="src/util.py", unrelated="src/unrelated.py")
+    called: list[str] = []
+
+    def succeed(plan: dict) -> dict:
+        called.append(str(plan.get("ref") or "") or "(default)")
+        return {"ok": True, "artifact": "repo.html", "documentation": docs}
+
+    def exists(_url: str, ref: str) -> dict:
+        return {"status": "exists", "sha": sha, "ref": ref, "error": ""}
+
+    def missing(_url: str, ref: str) -> dict:
+        return {
+            "status": "missing",
+            "sha": "",
+            "ref": ref,
+            "error": f"Requested ref not found: '{ref}' does not exist in {url}",
+        }
+
+    def unverified(_url: str, ref: str) -> dict:
+        return {"status": "unverified", "sha": "", "ref": ref, "error": "Git authentication failed"}
+
+    def sha_must_not_probe(_url: str, ref: str) -> dict:
+        raise AssertionError("SHA-shaped refs must not be probed as branch/tag names")
+
+    branch = ark_client.document_repository(
+        url, "develop", probe=exists, run_pipeline=succeed, registry_path=Path(tempfile.mkdtemp()) / "a.json"
+    )
+    check(branch.get("status") == "documented" and called[-1] == "develop",
+          "valid branch proceeds to the documentation pipeline")
+
+    tag = ark_client.document_repository(
+        url, "v1.3.0", probe=exists, run_pipeline=succeed, registry_path=Path(tempfile.mkdtemp()) / "b.json"
+    )
+    check(tag.get("status") == "documented" and called[-1] == "v1.3.0",
+          "valid tag proceeds to the documentation pipeline")
+
+    before_invalid = len(called)
+    bad_branch = ark_client.document_repository(
+        url, "no-such-branch", probe=missing, run_pipeline=succeed, registry_path=Path(tempfile.mkdtemp()) / "c.json"
+    )
+    check(bad_branch.get("status") == "failed" and bad_branch.get("runPipeline") is False,
+          "invalid branch is rejected before the pipeline")
+    check("does not exist" in str(bad_branch.get("error") or "").lower()
+          or "not found" in str(bad_branch.get("error") or "").lower(),
+          "invalid branch returns a resolution error")
+    check(len(called) == before_invalid, "invalid branch does not start a Query")
+
+    bad_tag = ark_client.document_repository(
+        url, "v9.9.9-missing", probe=missing, run_pipeline=succeed, registry_path=Path(tempfile.mkdtemp()) / "d.json"
+    )
+    check(bad_tag.get("status") == "failed" and len(called) == before_invalid,
+          "invalid tag is rejected before the pipeline")
+
+    sha_plan = ark_client.plan_documentation(url, sha, probe=sha_must_not_probe)
+    check(sha_plan.get("runPipeline") is True and sha_plan.get("currentCommit") == sha,
+          "valid commit SHA keeps existing SHA semantics and proceeds")
+
+    try:
+        ark_client.plan_documentation(url, "has space")
+        check(False, "malformed ref is rejected by syntax validation")
+    except validation.ValidationError as exc:
+        check("syntax" in str(exc).lower(), "malformed ref is rejected by syntax validation")
+
+    original_resolve = ark_client.resolve_commit_sha
+    ark_client.resolve_commit_sha = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("unverified persist must not network")
+    )
+    try:
+        auth = ark_client.document_repository(
+            url, "develop", probe=unverified, run_pipeline=succeed, registry_path=Path(tempfile.mkdtemp()) / "e.json"
+        )
+    finally:
+        ark_client.resolve_commit_sha = original_resolve
+    check(auth.get("status") == "documented" and called[-1] == "develop",
+          "authentication failure does not classify the ref as invalid")
+    check("does not exist" not in str(auth.get("error") or "").lower(),
+          "access failure is not reported as an invalid ref")
+
+    parsed = ark_client.probe_remote_ref(
+        url,
+        "develop",
+        runner=lambda _u, _p: _ls_remote_result(0, f"{sha}\trefs/heads/develop\n"),
+    )
+    check(parsed.get("status") == "exists" and parsed.get("sha") == sha,
+          "successful ls-remote marks the branch as existing")
+    gone = ark_client.probe_remote_ref(
+        url,
+        "no-such-branch",
+        runner=lambda _u, _p: _ls_remote_result(0, ""),
+    )
+    check(gone.get("status") == "missing", "empty ls-remote marks the branch as missing")
+    denied = ark_client.probe_remote_ref(
+        "https://gitlab.example.com/group/project",
+        "develop",
+        runner=lambda _u, _p: _ls_remote_result(
+            128, "", "fatal: Authentication failed for 'https://gitlab.example.com/group/project'"
+        ),
+    )
+    check(denied.get("status") == "unverified", "auth failure during ls-remote is unverified")
+    check("does not exist" not in str(denied.get("error") or "").lower(),
+          "auth failure is not reported as a missing ref")
+    private = ark_client.probe_remote_ref(
+        "https://gitlab.example.com/group/project",
+        "develop",
+        runner=lambda _u, _p: _ls_remote_result(
+            128, "", "ERROR: The project you were looking for could not be found."
+        ),
+    )
+    check(private.get("status") == "unverified",
+          "repository access failure is not reported as an invalid ref")
+    sha_probe = ark_client.probe_remote_ref(url, sha, runner=sha_must_not_probe)
+    check(sha_probe.get("status") == "unverified" and sha_probe.get("sha") == sha,
+          "full SHA is not looked up as a branch or tag")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "registry.json"
+        registry.record_success(url, sha, artifact="repo.html", documentation=docs, path=path)
+        failed = ark_client.document_repository(
+            url, "no-such-branch", probe=missing, run_pipeline=succeed, registry_path=path
+        )
+        check(failed.get("status") == "failed", "invalid ref fails documentation")
+        check(registry.lookup(url, path)["commitSha"] == sha,
+              "failed ref resolution does not modify the registry")
 
 
 def _remote_parent_sha(url: str, sha: str) -> str:
@@ -4940,6 +5088,10 @@ def test_pipeline_config() -> None:
     ), "webhook listener defaults on when Streamlit starts")
     check("def document_repository" in ark_client_src,
           "host CLI/UI/webhook share document_repository")
+    check("def probe_remote_ref" in ark_client_src,
+          "host planner probes remote refs before a Query")
+    check("build_git_env" in ark_client_src,
+          "host ref resolution reuses collector Git authentication")
     check("document_repository" in (ROOT / "app" / "webhook.py").read_text(encoding="utf-8"),
           "webhook uses the shared host documentation planner")
     check("document_repository" in (ROOT / "app" / "cli.py").read_text(encoding="utf-8"),
@@ -5501,6 +5653,83 @@ def test_renderer_unit() -> None:
     renderer_tests.run(check)
 
 
+def _cluster_query_names() -> set[str]:
+    result = subprocess.run(
+        ["kubectl", "get", "query", "-n", NAMESPACE, "-o", "json"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return set()
+    try:
+        items = json.loads(result.stdout).get("items") or []
+    except json.JSONDecodeError:
+        return set()
+    names = set()
+    for item in items:
+        if isinstance(item, dict):
+            name = str((item.get("metadata") or {}).get("name") or "")
+            if name:
+                names.add(name)
+    return names
+
+
+def test_valid_ref_resolution_e2e() -> None:
+    print("\nlive valid ref resolution")
+    _validation, ark_client, _registry = _host_modules()
+    probed = ark_client.probe_remote_ref(TARGET_REPO, "main")
+    check(probed.get("status") == "exists" and probed.get("sha"),
+          "live main branch resolves before a Query")
+    if probed.get("status") != "exists":
+        print(f"  info  probe={probed}")
+        return
+    called: list[str] = []
+
+    def succeed(plan: dict) -> dict:
+        called.append(str(plan.get("mode") or ""))
+        return {
+            "ok": True,
+            "artifact": "github-mcp-chatbot.html",
+            "documentation": _sample_docs(util="backend/agent/agent.py", unrelated="README.md"),
+        }
+
+    tmp = tempfile.mkdtemp(prefix="e2e-ref-valid-")
+    result = ark_client.document_repository(
+        TARGET_REPO,
+        "main",
+        run_pipeline=succeed,
+        registry_path=Path(tmp) / "registry.json",
+    )
+    check(result.get("status") == "documented" and called == ["full"],
+          "live valid branch proceeds through the planner")
+    check(result.get("currentCommit") == probed.get("sha"),
+          "live valid branch pins the resolved commit SHA")
+
+
+def test_invalid_ref_resolution_e2e() -> None:
+    print("\nlive invalid ref resolution")
+    _validation, ark_client, _registry = _host_modules()
+    missing = "this-ref-does-not-exist-xyz-e2e"
+    before = _cluster_query_names()
+    tmp = tempfile.mkdtemp(prefix="e2e-ref-invalid-")
+    result = ark_client.document_repository(
+        TARGET_REPO,
+        missing,
+        registry_path=Path(tmp) / "registry.json",
+    )
+    after = _cluster_query_names()
+    created = sorted(after - before)
+    check(result.get("status") == "failed" and result.get("runPipeline") is False,
+          "live invalid ref fails before the pipeline")
+    check("not found" in str(result.get("error") or "").lower(),
+          "live invalid ref returns a resolution error")
+    check(not created, f"invalid ref created no ARK Query (new={created})")
+    check(ark_client.documented_commit(TARGET_REPO, registry_path=Path(tmp) / "registry.json") == "",
+          "live invalid ref does not write the registry")
+
+
 def main() -> int:
     test_filtering_and_structure()
     test_determinism_and_render()
@@ -5531,6 +5760,7 @@ def main() -> int:
     test_incremental_context_optimization()
     test_webhook_automation()
     test_cli_planner()
+    test_ref_resolution()
     test_pipeline_config()
     if "--network" in sys.argv:
         test_live_clone()
@@ -5540,6 +5770,8 @@ def main() -> int:
     if "--e2e" in sys.argv:
         test_pipeline_e2e()
         test_cli_documentation_e2e()
+        test_valid_ref_resolution_e2e()
+        test_invalid_ref_resolution_e2e()
         test_self_repo_incremental_e2e()
     else:
         print("skipping deployed end-to-end test (pass --e2e to enable)")

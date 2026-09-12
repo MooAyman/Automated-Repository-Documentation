@@ -50,6 +50,7 @@ def run(
     registry_path: str | Path | None = None,
     run_pipeline: Callable[[dict], dict] | None = None,
     current_sha: str = "",
+    probe: Callable[[str, str], dict] | None = None,
 ) -> dict:
     """Same planner/execution as the UI and webhook."""
     return ark_client.document_repository(
@@ -58,6 +59,7 @@ def run(
         current_sha=current_sha,
         registry_path=registry_path,
         run_pipeline=run_pipeline,
+        probe=probe,
     )
 
 
