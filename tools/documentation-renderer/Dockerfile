@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY renderer.py server.py ./
+COPY renderer.py server.py merge.py ./
 
 RUN useradd --uid 1001 --no-create-home --home-dir /tmp renderer
 USER 1001

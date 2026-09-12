@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY server.py mapper.py ./
+COPY server.py mapper.py impact.py ./
 
 RUN useradd --uid 1001 --no-create-home --home-dir /tmp mapper
 USER 1001

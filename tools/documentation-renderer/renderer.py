@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from merge import documentation_only, merge_documentation, normalize_section_sources
+
 REQUIRED_ROOT = (
     "repositoryOverview",
     "repositoryStructure",
@@ -108,8 +110,13 @@ def safe_output_filename(name: str) -> str:
     return cleaned[:80] + ".html"
 
 
-def persist_html(html_page: str, repository_name: str, output_dir: str | None = None) -> dict:
-    """Write HTML under output_dir and return {ok, filename, path, bytes}."""
+def persist_html(
+    html_page: str,
+    repository_name: str,
+    output_dir: str | None = None,
+    document: dict | None = None,
+) -> dict:
+    """Write HTML (and optional JSON sidecar) atomically. Failure leaves the last files."""
     directory = (output_dir if output_dir is not None else os.environ.get("OUTPUT_DIR", "") or "").strip()
     if not directory:
         raise RenderError("OUTPUT_DIR is not configured")
@@ -120,16 +127,131 @@ def persist_html(html_page: str, repository_name: str, output_dir: str | None = 
     dest = (root / filename).resolve()
     if dest.parent != root:
         raise RenderError("invalid output path")
-    dest.write_text(html_page, encoding="utf-8")
+    sidecar = dest.with_suffix(".json")
+    html_tmp = dest.with_suffix(".html.tmp")
+    json_tmp = dest.with_suffix(".json.tmp")
+    try:
+        html_tmp.write_text(html_page, encoding="utf-8")
+        if document is not None:
+            json_tmp.write_text(
+                json.dumps(documentation_only(document), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        os.replace(html_tmp, dest)
+        if document is not None:
+            os.replace(json_tmp, sidecar)
+    except Exception:
+        for tmp in (html_tmp, json_tmp):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
     return {
         "ok": True,
         "filename": filename,
         "path": str(dest),
         "bytes": len(html_page.encode("utf-8")),
+        "documentation": str(sidecar) if document is not None else "",
     }
 
 
-def extract_document(payload: object) -> dict:
+def _optional_json(value: object, path: str) -> dict | None:
+    if value in (None, "", {}):
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise RenderError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RenderError(f"{path} must be an object")
+    return value
+
+
+KNOWN_EXTRAS = ("incrementalImpact", "sectionSources")
+
+
+def load_previous_sidecar(repository_name: str, output_dir: str | None = None) -> dict | None:
+    """Last persisted documentation JSON beside the HTML artifact. Not repository source."""
+    return _load_named_sidecar(repository_name, ".json", output_dir)
+
+
+def load_impact_sidecar(repository_name: str, output_dir: str | None = None) -> dict | None:
+    """Host-computed incremental impact JSON beside the HTML artifact. Not repository source."""
+    return _load_named_sidecar(repository_name, ".impact.json", output_dir)
+
+
+def _load_named_sidecar(
+    repository_name: str,
+    suffix: str,
+    output_dir: str | None = None,
+) -> dict | None:
+    directory = (output_dir if output_dir is not None else os.environ.get("OUTPUT_DIR", "") or "").strip()
+    if not directory or not (repository_name or "").strip():
+        return None
+    try:
+        root = Path(directory).expanduser().resolve()
+    except OSError:
+        return None
+    stem = Path(safe_output_filename(repository_name)).stem
+    sidecar = root / f"{stem}{suffix}"
+    try:
+        sidecar = sidecar.resolve()
+    except OSError:
+        return None
+    if sidecar.parent != root or not sidecar.is_file():
+        return None
+    try:
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _take_known_extras(data: dict) -> dict:
+    extras: dict = {}
+    raw_impact = data.pop("incrementalImpact", None)
+    raw_sources = data.pop("sectionSources", None)
+    if raw_impact not in (None, ""):
+        extras["impact"] = _optional_json(raw_impact, "incrementalImpact")
+    if raw_sources not in (None, "", {}, "{}"):
+        parsed = raw_sources
+        if isinstance(raw_sources, str):
+            parsed = _optional_json(raw_sources, "sectionSources")
+        extras["sectionSources"] = normalize_section_sources(parsed)
+    return extras
+
+
+def resolve_document(payload: object) -> dict:
+    """Extract generated docs and merge with previous when impact is provided.
+
+    Production ARK path: previous docs and impact come from sidecars next to
+    the HTML artifact. Request-level previousDocumentation/impact still win.
+    """
+    data = _require_object(payload, "request body")
+    extras: dict = {}
+    generated = extract_document(payload, extras=extras)
+    previous = _optional_json(
+        data.get("previousDocumentation") or data.get("previousDocumentationJson"),
+        "previousDocumentation",
+    )
+    if previous is None:
+        previous = load_previous_sidecar(str(data.get("repositoryName") or ""))
+    impact = _optional_json(data.get("impact") or data.get("impactJson"), "impact")
+    if impact is None:
+        impact = extras.get("impact")
+    if impact is None:
+        impact = load_impact_sidecar(str(data.get("repositoryName") or ""))
+    sources = extras.get("sectionSources")
+    if previous:
+        previous = extract_document(previous)
+    if previous and impact:
+        return merge_documentation(previous, generated, impact, section_sources=sources)
+    return generated
+
+
+def extract_document(payload: object, extras: dict | None = None) -> dict:
     """Accept `{documentation: {...}|json-string}` or the six-key document itself."""
     data = _require_object(payload, "request body")
     if "documentation" in data:
@@ -140,6 +262,10 @@ def extract_document(payload: object) -> dict:
             except json.JSONDecodeError as exc:
                 raise RenderError(f"documentation is not valid JSON: {exc}") from exc
         data = _require_object(doc, "documentation")
+    data = dict(data)
+    collected = _take_known_extras(data)
+    if extras is not None:
+        extras.update(collected)
     missing = [key for key in REQUIRED_ROOT if key not in data]
     if missing:
         raise RenderError("missing required fields: " + ", ".join(missing))
@@ -295,7 +421,7 @@ def _page_title(doc: dict) -> str:
 
 
 def render(payload: object) -> str:
-    doc = extract_document(payload)
+    doc = resolve_document(payload)
     overview = doc["repositoryOverview"]
     architecture = doc["coreConceptsAndArchitecture"]
     categorized = doc["categorizedTechnicalInformation"]

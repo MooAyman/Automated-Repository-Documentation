@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import html
+import importlib
 import sys
 import webbrowser
 from pathlib import Path
@@ -18,6 +19,11 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import ark_client  # noqa: E402
+import webhook  # noqa: E402
+
+ark_client = importlib.reload(ark_client)
+
+_WEBHOOK_SERVER = webhook.ensure_started()
 
 LOGO = APP_DIR / "assets" / "aman-logo.png"
 
@@ -232,6 +238,7 @@ def _run_pipeline(url: str, ref: str) -> None:
     st.session_state.pop("last_artifact", None)
     st.session_state.pop("last_html", None)
     st.session_state.pop("status", None)
+    st.session_state.pop("mode", None)
 
     try:
         plan = ark_client.plan_documentation(url, ref)
@@ -241,6 +248,7 @@ def _run_pipeline(url: str, ref: str) -> None:
 
     if plan["status"] == "already_documented":
         st.session_state["status"] = "already_documented"
+        st.session_state["mode"] = "already_documented"
         _load_existing_artifact(plan.get("artifact") or "")
         return
 
@@ -257,32 +265,9 @@ def _run_pipeline(url: str, ref: str) -> None:
         progress.markdown(f'<p class="aman-progress">{label}</p>', unsafe_allow_html=True)
 
     def run_pipeline(_plan: dict) -> dict:
-        try:
-            message = ark_client.build_input(
-                url,
-                ref,
-                previous_commit=plan.get("previousCommit") or "",
-                new_commit=plan.get("currentCommit") or "",
-            )
-            name = ark_client.query_name(url)
-            ark_client.apply_pipeline_query(name, message)
-            obj = ark_client.wait_for_query(name, on_phase=on_phase)
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-        phase = (obj.get("status") or {}).get("phase")
-        content = ark_client.query_response(obj)
-        if phase != "done":
-            return {"ok": False, "error": content or f"Pipeline stopped (phase={phase})"}
-
-        filename = ark_client.filename_from_response(content)
-        if not filename:
-            return {"ok": False, "error": "The pipeline finished without an HTML filename."}
-
-        path = ark_client.artifact_path(filename)
-        if not path.is_file():
-            return {"ok": False, "error": f"{filename} was named, but the file is not on disk yet."}
-        return {"ok": True, "artifact": filename}
+        _plan = dict(_plan)
+        _plan["ref"] = ref
+        return ark_client.run_ark_pipeline(_plan, on_phase=on_phase)
 
     result = ark_client.execute_documentation_plan(plan, run_pipeline=run_pipeline)
     progress.empty()
@@ -291,6 +276,7 @@ def _run_pipeline(url: str, ref: str) -> None:
         return
 
     st.session_state["status"] = "documented"
+    st.session_state["mode"] = result.get("mode") or plan.get("mode") or "full"
     filename = result.get("artifact") or ""
     if filename:
         path = ark_client.artifact_path(filename)
@@ -298,8 +284,13 @@ def _run_pipeline(url: str, ref: str) -> None:
         st.session_state["last_html"] = path.read_bytes()
 
 
-def _success(filename: str, data: bytes, *, already: bool = False) -> None:
-    kicker = "Already documented" if already else "Documentation generated"
+def _success(filename: str, data: bytes, *, already: bool = False, mode: str = "") -> None:
+    if already:
+        kicker = "Already documented"
+    elif mode == "incremental":
+        kicker = "Documentation updated"
+    else:
+        kicker = "Documentation generated"
     st.markdown(
         f"""
         <div class="aman-success">
@@ -357,6 +348,16 @@ def main() -> None:
                 type="primary",
                 width="stretch",
             )
+        if _WEBHOOK_SERVER is not None:
+            port = _WEBHOOK_SERVER.server_address[1]
+            st.caption(
+                f"Push webhook listening on http://127.0.0.1:{port}/webhook. "
+                "GitHub/GitLab must be able to reach this URL (tunnel or public host)."
+            )
+        elif not webhook.webhook_enabled():
+            st.caption("Push webhook is disabled (WEBHOOK_ENABLED=0).")
+        else:
+            st.caption("Push webhook did not start. Check that port 8787 is free.")
         if submitted:
             try:
                 ark_client.validate_pipeline_input(url, ref)
@@ -377,7 +378,12 @@ def main() -> None:
         data = st.session_state.get("last_html")
         already = st.session_state.get("status") == "already_documented"
         if filename and data:
-            _success(filename, data, already=already)
+            _success(
+                filename,
+                data,
+                already=already,
+                mode=str(st.session_state.get("mode") or ""),
+            )
         elif already:
             st.markdown(
                 '<p class="aman-progress">This commit is already documented.</p>',

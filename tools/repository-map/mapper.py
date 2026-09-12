@@ -54,9 +54,11 @@ def normalize_request(payload: Any) -> dict[str, Any]:
             raise MapError("analysisJson must be analyzer JSON")
     if not isinstance(analysis, dict):
         raise MapError("already-sanitized analyzer JSON is required")
-    if not all(isinstance(analysis.get(key), list) for key in ("files", "unparsed", "references")):
-        raise MapError("analysis must be repository-analyzer output")
-    return analysis
+    return {
+        "files": analysis["files"] if isinstance(analysis.get("files"), list) else [],
+        "unparsed": analysis["unparsed"] if isinstance(analysis.get("unparsed"), list) else [],
+        "references": analysis["references"] if isinstance(analysis.get("references"), list) else [],
+    }
 
 
 def _module_row(path: str, status: str, reason: str | None = None) -> dict[str, Any]:

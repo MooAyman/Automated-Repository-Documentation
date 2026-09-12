@@ -2,6 +2,7 @@
 
     GET  /health  -> ok
     POST /map     -> application/json repository map
+    POST /impact  -> application/json incremental analysis scope
 
 Accepts already-sanitized repository-analyzer JSON only.
 Does not clone repositories, parse source, or resolve references.
@@ -15,6 +16,7 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from impact import ImpactError, normalize_request as build_impact
 from mapper import MapError, build
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -50,7 +52,8 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(404, f"unknown path: {self.path}", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/map":
+        path = self.path.rstrip("/")
+        if path not in ("/map", "/impact"):
             self._respond(404, f"unknown path: {self.path}", "text/plain; charset=utf-8")
             return
         try:
@@ -68,23 +71,36 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(400, f"invalid JSON request body: {exc}", "text/plain; charset=utf-8")
             return
         try:
-            result = build(payload)
-        except MapError as exc:
-            log.warning("map rejected (%d bytes): %s", length, exc)
-            self._respond(400, f"invalid map request: {exc}", "text/plain; charset=utf-8")
+            if path == "/impact":
+                result = build_impact(payload)
+            else:
+                result = build(payload)
+        except (MapError, ImpactError) as exc:
+            kind = "impact" if path == "/impact" else "map"
+            log.warning("%s rejected (%d bytes): %s", kind, length, exc)
+            self._respond(400, f"invalid {kind} request: {exc}", "text/plain; charset=utf-8")
             return
         except Exception as exc:  # noqa: BLE001
             log.exception("unexpected map error")
             self._respond(500, f"unexpected map error: {exc}", "text/plain; charset=utf-8")
             return
         body = json.dumps(result, ensure_ascii=False)
-        log.info(
-            "mapped %d modules (%d symbols, %d relationships, %d request bytes)",
-            len(result["modules"]),
-            len(result["symbols"]),
-            len(result["relationships"]),
-            length,
-        )
+        if path == "/impact":
+            log.info(
+                "impact changed=%d affected=%d modules=%d request_bytes=%d",
+                len(result.get("changed") or []),
+                len(result.get("affected") or []),
+                len(result.get("affectedModules") or []),
+                length,
+            )
+        else:
+            log.info(
+                "mapped %d modules (%d symbols, %d relationships, %d request bytes)",
+                len(result["modules"]),
+                len(result["symbols"]),
+                len(result["relationships"]),
+                length,
+            )
         self._respond(200, body, "application/json; charset=utf-8")
 
 

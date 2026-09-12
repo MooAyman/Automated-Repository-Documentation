@@ -17,7 +17,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from renderer import RenderError, persist_html, render, safe_output_filename
+from renderer import RenderError, persist_html, render, resolve_document, safe_output_filename
 
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(2 * 1024 * 1024)))
@@ -97,9 +97,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         persist = bool(isinstance(payload, dict) and payload.get("persist"))
         repository_name = ""
+        document = None
         if isinstance(payload, dict):
             repository_name = str(payload.get("repositoryName") or "").strip()
         try:
+            document = resolve_document(payload)
             page = render(payload)
         except RenderError as exc:
             log.warning("render rejected (%d bytes persist=%s): %s", length, persist, exc)
@@ -112,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
         artifact = None
         if OUTPUT_DIR:
             try:
-                artifact = persist_html(page, repository_name, OUTPUT_DIR)
+                artifact = persist_html(page, repository_name, OUTPUT_DIR, document=document)
                 log.info("wrote artifact %s (%d bytes)", artifact["filename"], artifact["bytes"])
             except RenderError as exc:
                 log.warning("artifact write failed: %s", exc)

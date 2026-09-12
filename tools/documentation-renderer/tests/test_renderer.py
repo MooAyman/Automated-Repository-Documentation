@@ -158,6 +158,12 @@ def run(check) -> None:
         check(written.is_file() and "POST /chat" in written.read_text(encoding="utf-8"),
               "persist writes standalone HTML to the output directory")
 
+    extras = sample_document()
+    extras["incrementalImpact"] = ""
+    extras["sectionSources"] = "{}"
+    check("backend/agent/agent.py" in renderer.render({"documentation": extras}),
+          "empty incremental extras are stripped and do not fail render")
+
 
 def main() -> int:
     failures: list[str] = []

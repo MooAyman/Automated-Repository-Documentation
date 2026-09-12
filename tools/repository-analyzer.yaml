@@ -1,8 +1,9 @@
 # ARK Tool: deterministic Python AST analysis of already-sanitized source.
 #
-# Called by Agent/repository-documentation after repository-collector.
-# Accepts sanitized per-file content (preferred) or the sanitized collector
-# dump. Does not clone repositories or call a language model.
+# Host-side incremental/full sidecar analysis posts dump directly to /analyze.
+# The documentation Agent must not pass the collector dump through this Tool:
+# interpolating dump into the model tool call overflows gpt-4o-mini context.
+# Compact filesJson only. Empty files analyzes nothing.
 apiVersion: ark.mckinsey.com/v1alpha1
 kind: Tool
 metadata:
@@ -13,28 +14,20 @@ metadata:
 spec:
   type: http
   description: >-
-    Analyzes already-sanitized repository source with a conservative Python
-    AST. Returns classes, functions, parameter names, imports, decorator
-    names, inheritance names, direct calls, and basic references. Pass the
-    collector dump or sanitized per-file {path, content}. Do not pass a
-    repository URL or unsanitized source. Non-Python files are unsupported.
-    Unparseable Python is reported, not guessed. Additional evidence only;
-    the collector dump remains the source of truth.
+    Analyzes already-sanitized per-file Python source with a conservative AST.
+    Pass filesJson, a JSON array of {path, content}. Do not pass a collector
+    dump, repository URL, or unsanitized source. Host-side analysis may POST
+    dump directly to /analyze. Additional evidence only; the collector dump
+    remains the source of truth.
   inputSchema:
     type: object
     additionalProperties: false
     properties:
-      dump:
-        type: string
-        description: >-
-          The already-sanitized collector dump, unchanged. The analyzer
-          splits FILE sections and analyzes Python files only. Prefer this
-          when calling from the documentation agent after collection.
       filesJson:
         type: string
         description: >-
-          Optional JSON array of {path, content} objects whose content is
-          already sanitized. When set, it is used instead of dump.
+          JSON array of {path, content} objects whose content is already
+          sanitized. Omit or use [] rather than embedding a collector dump.
   http:
     url: http://repository-analyzer.default.svc.cluster.local:8080/analyze
     method: POST
@@ -44,4 +37,4 @@ spec:
         value:
           value: application/json
     body: |
-      {{if .input.filesJson}}{"files": {{.input.filesJson}}}{{else}}{"dump": {{printf "%q" .input.dump}}}{{end}}
+      {{if .input.filesJson}}{"files": {{.input.filesJson}}}{{else}}{"files":[]}{{end}}

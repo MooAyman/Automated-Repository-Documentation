@@ -28,9 +28,11 @@ spec:
     - repository-documentation: the only way to produce documentation JSON.
     - documentation-renderer: the only way to produce the HTML artifact.
 
-    Do not call repository-collector, repository-analyzer, repository-map, or
-    repository-changes. The documentation agent already owns collection, AST
-    analysis, the Repository Map, and change detection.
+    Do not call repository-collector, repository-analyzer, repository-map,
+    repository-changes, or repository-impact. Change detection, AST analysis,
+    the Repository Map, and incremental impact are computed outside this
+    orchestrator. The documentation agent collects the dump and writes
+    documentation.
 
     WHEN THE USER ASKS TO DOCUMENT A REPOSITORY
 
@@ -39,23 +41,45 @@ spec:
        (for example "branch: develop" or "ref: v2.4.1"). Do not invent a ref.
     3. Extract `previousCommit` and `newCommit` only if the user supplied those
        exact SHA fields. Do not invent, infer, or look up commit SHAs.
-    4. Call repository-documentation exactly once. Set `input` to a single
-       sentence that contains the URL and, if present, the ref and the supplied
-       SHAs. Example with SHAs:
+       If the user also supplied `incrementalImpact` JSON, keep that JSON
+       unchanged in the documentation Agent input. Do not invent, summarise,
+       rewrite, or drop it.
+       If the user also supplied `incrementalDump` text, keep that dump
+       unchanged in the documentation Agent input. Do not invent, summarise,
+       rewrite, or drop it.
+       If the user also supplied `updateFields` JSON, keep that list unchanged
+       in the documentation Agent input. Do not invent, summarise, rewrite, or
+       drop it.
+       If the user also supplied `previousSections` JSON, keep that JSON
+       unchanged in the documentation Agent input. Do not invent, summarise,
+       rewrite, or drop it.
+       If the user also supplied `previousDocumentation` JSON, keep that JSON
+       unchanged in the documentation Agent input. Do not invent, summarise,
+       rewrite, or drop it.
+    4. Call repository-documentation exactly once. Set `input` to the user's
+       repository sentence (URL and, if present, the ref and supplied SHAs)
+       plus the `incrementalDump` text when the user supplied it, plus the
+       `updateFields` list when the user supplied it, plus the
+       `previousSections` JSON when the user supplied it, plus the
+       `incrementalImpact` JSON when the user supplied it, plus the
+       `previousDocumentation` JSON when the user supplied it.
+       Example with SHAs:
        "Document https://github.com/org/repo ref: develop previousCommit: <sha> newCommit: <sha>"
        If no SHAs were supplied, keep the V1.3.0 sentence:
        "Document https://github.com/org/repo ref: develop"
     5. If that call fails, stop. Reply that documentation generation failed and
        include the error. Do not call documentation-renderer.
-    6. The tool result is the complete structured documentation JSON. Do not
-       summarise, rewrite, or extract fields from it.
+    6. The tool result is the structured documentation. Copy each outputSchema
+       field into the renderer `documentation` object. Do not summarise or
+       rewrite the wording. Do not serialise the result into one JSON string.
     7. Call documentation-renderer exactly once with:
-       - documentationJson: the exact JSON text returned by
-         repository-documentation, unchanged
+       - documentation: the nested six-section object (same field names as
+         the documentation Agent outputSchema)
        - persist: true
        - repositoryName: the repository name only (the last path segment,
          without .git). Example: github-mcp-chatbot
-       Do not populate the nested `documentation` object.
+       Do not pass `documentationJson`. The renderer HTTP body quotes each
+       string field; a single JSON blob is how large copies become invalid.
     8. If rendering fails, stop. Reply that HTML rendering failed and include
        the error.
     9. After renderer success, reply with only:

@@ -67,10 +67,23 @@ def load_registry(path: str | Path | None = None) -> dict:
     return raw
 
 
+def _identity_aliases(identity: str) -> list[str]:
+    aliases = [identity]
+    if identity.startswith("www."):
+        aliases.append(identity[4:])
+    else:
+        aliases.append(f"www.{identity}")
+    return aliases
+
+
 def lookup(repository_url: str, path: str | Path | None = None) -> dict | None:
     identity = repository_identity(repository_url)
-    record = load_registry(path).get("repositories", {}).get(identity)
-    return dict(record) if isinstance(record, dict) else None
+    repos = load_registry(path).get("repositories", {})
+    for key in _identity_aliases(identity):
+        record = repos.get(key)
+        if isinstance(record, dict):
+            return dict(record)
+    return None
 
 
 def record_success(
@@ -78,11 +91,14 @@ def record_success(
     commit_sha: str,
     *,
     artifact: str = "",
+    documentation: dict | None = None,
+    section_files: dict | None = None,
     path: str | Path | None = None,
 ) -> dict:
     """Persist a SHA only after successful documentation.
 
-    Same SHA does not create a new documentation version.
+    Same SHA does not create a new documentation version and does not replace
+    the last successful documentation JSON.
     """
     url = validate_repository_url(repository_url)
     sha = validate_commit_sha(commit_sha, required=True)
@@ -90,6 +106,9 @@ def record_success(
     dest = registry_path(path)
     data = load_registry(dest)
     existing = data["repositories"].get(identity)
+    if not isinstance(existing, dict):
+        legacy = data["repositories"].pop(f"www.{identity}", None)
+        existing = legacy if isinstance(legacy, dict) else None
     if isinstance(existing, dict) and same_commit(str(existing.get("commitSha") or ""), sha):
         return dict(existing)
 
@@ -111,6 +130,14 @@ def record_success(
         "artifact": str(artifact or (existing or {}).get("artifact") or ""),
         "updatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }
+    if isinstance(documentation, dict):
+        record["documentation"] = documentation
+    elif isinstance(existing, dict) and isinstance(existing.get("documentation"), dict):
+        record["documentation"] = existing["documentation"]
+    if isinstance(section_files, dict):
+        record["sectionFiles"] = section_files
+    elif isinstance(existing, dict) and isinstance(existing.get("sectionFiles"), dict):
+        record["sectionFiles"] = existing["sectionFiles"]
     data["schemaVersion"] = SCHEMA_VERSION
     data["repositories"][identity] = record
     _write_registry(dest, data)

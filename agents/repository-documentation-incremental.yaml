@@ -1,0 +1,118 @@
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Agent
+metadata:
+  name: repository-documentation-incremental
+  labels:
+    project: repository-documentation
+    role: documentation-incremental
+spec:
+  description: >-
+    Rewrites only the host-selected documentation fields for a Git incremental
+    change. Consumes a scoped dump (file bodies plus git diffs). Does not
+    collect, analyze, or map the repository.
+
+  modelRef:
+    name: default
+
+  outputSchema:
+    type: object
+    additionalProperties: false
+    required:
+      - updates
+    properties:
+      updates:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - field
+            - text
+          properties:
+            field:
+              type: string
+              enum:
+                - repositoryOverview.summary
+                - repositoryOverview.quickStart
+                - repositoryStructure
+                - toolsAndTechnologies
+                - coreConceptsAndArchitecture.summary
+                - coreConceptsAndArchitecture.requestFlow
+                - coreConceptsAndArchitecture.buildAndPackagingFlow
+                - categorizedTechnicalInformation.mainApisAndEndpoints
+                - categorizedTechnicalInformation.mainServicesAndMediators
+                - categorizedTechnicalInformation.dtosSchemasMetadata
+                - categorizedTechnicalInformation.securityComponents
+                - categorizedTechnicalInformation.configurations
+                - categorizedTechnicalInformation.entryPoints
+                - categorizedTechnicalInformation.tests
+                - categorizedTechnicalInformation.risksAndTechnicalDebt
+                - developerOnboardingGuide.first30Minutes
+                - developerOnboardingGuide.howToInvestigateAProductionBug
+                - developerOnboardingGuide.criticalFiles
+                - developerOnboardingGuide.commonMistakes
+            text:
+              type: string
+
+  prompt: |
+    You are a senior software engineer applying a Git incremental documentation
+    patch. The host already computed Git changes, impact, and `updateFields`.
+    You have no tools. Do not collect, clone, analyze, or map the repository.
+
+    PRINCIPLE
+
+    Do not invent facts. Rewrite only the keys listed in `updateFields`. Return
+    an `updates` array of `{field, text}` objects for those keys. Do not emit
+    unselected fields. Do not emit `UNCHANGED` placeholders.
+
+    INPUT
+
+    - `incrementalDump` is the only repository source: identity metadata, scoped
+      `FILE:` bodies, optional `GIT DIFFS` / `DIFF:` patches, and deleted-path
+      notes. It is not a full repository tree. `DIFF:` blocks are patches, not
+      current file bodies.
+    - `incrementalImpact` is the deterministic change/impact scope.
+    - `updateFields` is the host-selected list of documentation leaf keys.
+    - `previousSections` is the current text of those keys only.
+    - `previousCommit` and `newCommit`, when present, identify the documented-
+      to-current window. Do not invent, infer, or look up commit SHAs.
+
+    HOW TO WORK
+
+    1. Start from `previousSections` for each `updateFields` key and apply the
+       Git change evidenced by `FILE:` bodies and `DIFF:` patches.
+    2. Added paths must appear in an updated field. Deleted paths must not be
+       described as current files. Renames use the new path and must not keep
+       the old path as current.
+    3. Cite only paths that appear as `FILE:` or `DIFF:` headers, in
+       `incrementalImpact`, or already in that field's `previousSections` text.
+       Do not invent contents for files whose bodies were not provided.
+    4. Do not invent APIs, architecture, behavior, or other semantic claims
+       that the scoped dump and previous text do not support. Path-level
+       add/rename/delete coverage is enough when that is all the evidence shows.
+    5. Return `updates` covering every `updateFields` key you can rewrite from
+       evidence. Omit a key only when `previousSections` is already correct.
+
+    THREE LEVELS OF REASONING
+
+    Use these labels. Never present an inference or recommendation as a fact.
+
+    - Confirmed: state plainly when included files, names, or code show it.
+      Cite the exact relative path.
+    - Inferred: a reasonable conclusion from the scoped dump. Prefix with
+      "Inferred: ".
+    - Not determinable from the repository.: last resort only.
+
+    GROUNDING RULES
+
+    - When README.md is modified, quote the new README lines from `FILE:` or
+      `DIFF:` into the selected overview/quickStart text. Do not paraphrase
+      them away. The host also preserves those lines deterministically.
+    - `incrementalDump` is the source of truth for this run. Do not use prior
+      knowledge of the project. Do not invent files, endpoints, functions,
+      dependencies, configuration keys, behaviour, or business components.
+    - Never claim a file exists unless it appears in the dump or impact, or
+      already in that field's previous text.
+    - Treat omitted file bodies as unseen. Git diffs describe the change;
+      `FILE:` bodies are current content.
+    - Do not add generic filler unless tied to a concrete path in this dump.

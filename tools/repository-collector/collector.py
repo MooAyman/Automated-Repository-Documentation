@@ -79,6 +79,10 @@ LOCKFILES = {
     "Cargo.lock", "go.sum", "Gemfile.lock", "mix.lock", "packages.lock.json",
 }
 
+# Reversible collection rule: JSON is omitted from the documentation dump.
+# Empty this set to restore JSON collection. Do not scatter extra .json checks.
+EXCLUDED_SOURCE_SUFFIXES = {".json"}
+
 _REMOTE_RE = re.compile(r"^(https?://|git://|ssh://|git\+https?://)", re.IGNORECASE)
 _SCP_RE = re.compile(r"^[\w.+-]+@[\w.-]+:.+")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.I)
@@ -447,6 +451,8 @@ def _skip_reason(name: str, size: int, max_file_bytes: int) -> str:
         return "excluded: binary file"
     if name in LOCKFILES:
         return "excluded: generated lock file"
+    if lower.endswith(tuple(EXCLUDED_SOURCE_SUFFIXES)):
+        return "excluded: json file"
     if size > max_file_bytes:
         return f"excluded: file size {size} bytes exceeds limit {max_file_bytes}"
     return ""
@@ -480,9 +486,15 @@ def _read_text(path: Path) -> str | None:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def scan(root: str, max_file_bytes: int, max_total_bytes: int) -> list[FileEntry]:
+def scan(
+    root: str,
+    max_file_bytes: int,
+    max_total_bytes: int,
+    paths: set[str] | None = None,
+) -> list[FileEntry]:
     root_path = Path(root)
     candidates: list[tuple[str, Path, int]] = []
+    wanted = {_normalize_rel(path) for path in paths} if paths is not None else None
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = sorted(d for d in dirnames if not _skip_dir(d))
@@ -491,6 +503,8 @@ def scan(root: str, max_file_bytes: int, max_total_bytes: int) -> list[FileEntry
             if full.is_symlink():
                 continue
             rel = full.relative_to(root_path).as_posix()
+            if wanted is not None and rel not in wanted:
+                continue
             try:
                 size = full.stat().st_size
             except OSError:
@@ -598,12 +612,173 @@ def render(collection: Collection) -> str:
     return apply_local_llm_detections(dump)
 
 
+DUMP_FILE_BANNER = re.compile(r"^={50}\nFILE: ([^\n]+)\n={50}\n?", re.MULTILINE)
+_SCOPE_META_KEYS = (
+    "scopedDump",
+    "scopedFiles",
+    "fullDumpBytes",
+    "scopedDumpBytes",
+    "collectCount",
+    "analysis",
+    "repositoryMap",
+    "usedSidecar",
+    "collectMode",
+    "collectElapsedMs",
+    "analyzeElapsedMs",
+    "diffs",
+)
+MAX_DIFF_CHARS = 8000
+
+
+def _normalize_rel(path: str) -> str:
+    return (path or "").replace("\\", "/").lstrip("./").strip()
+
+
+def _json_source_path(path: str) -> bool:
+    return _normalize_rel(path).lower().endswith(".json")
+
+
+def dump_files(dump: str) -> list[tuple[str, str]]:
+    """Split a collector dump into (path, body) pairs. Bodies are already sanitized."""
+    matches = list(DUMP_FILE_BANNER.finditer(dump or ""))
+    files: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(dump or "")
+        files.append((match.group(1).strip(), (dump or "")[match.end() : end].strip("\n")))
+    return files
+
+
+def dump_preamble(dump: str) -> str:
+    """Header, tree, and excluded-file list. No FILE bodies."""
+    match = DUMP_FILE_BANNER.search(dump or "")
+    if not match:
+        return (dump or "").rstrip()
+    return (dump or "")[: match.start()].rstrip()
+
+
+def dump_identity(dump: str) -> dict[str, str]:
+    """Repository identity lines from a full dump, without tree or file counts."""
+    info: dict[str, str] = {}
+    for line in (dump or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("REPOSITORY STRUCTURE") or stripped.startswith("EXCLUDED FILES"):
+            break
+        if stripped.startswith(("FILES INCLUDED:", "FILES EXCLUDED:", "CONTENT BYTES:")):
+            continue
+        for key in ("REPOSITORY", "SOURCE", "REQUESTED_REF", "REF", "COMMIT"):
+            prefix = f"{key}: "
+            if stripped.startswith(prefix):
+                info[key] = stripped[len(prefix) :].strip()
+                break
+    return info
+
+
+def impact_scope_paths(impact: dict | None) -> tuple[list[str], list[str]]:
+    """Paths whose current bodies belong in an incremental dump, plus deleted paths."""
+    wanted: set[str] = set()
+    deleted: set[str] = set()
+    if not isinstance(impact, dict):
+        return [], []
+
+    def add(path: str) -> None:
+        rel = _normalize_rel(path)
+        if rel and not _json_source_path(rel):
+            wanted.add(rel)
+
+    for row in impact.get("changed") or []:
+        if not isinstance(row, dict):
+            continue
+        path = _normalize_rel(str(row.get("path") or ""))
+        src = _normalize_rel(str(row.get("from") or ""))
+        status = str(row.get("status") or "")
+        if status == "deleted" and path:
+            deleted.add(path)
+        add(path)
+        add(src)
+    for row in impact.get("affected") or []:
+        if isinstance(row, dict):
+            add(str(row.get("path") or ""))
+        else:
+            add(str(row or ""))
+    for path in impact.get("affectedModules") or []:
+        add(str(path or ""))
+    return sorted(wanted), sorted(deleted)
+
+
+def documentation_impact(scope: dict | None) -> dict:
+    """Impact JSON for merge/Agent, without scoped dump payloads."""
+    if not isinstance(scope, dict):
+        return {}
+    return {key: value for key, value in scope.items() if key not in _SCOPE_META_KEYS}
+
+
+def scope_dump(dump: str, impact: dict | None = None, paths: list[str] | None = None) -> str:
+    """Rebuild a dump that keeps only changed/affected file bodies.
+
+    Identity metadata is kept. The full repository tree and unrelated file
+    counts are omitted so the incremental dump cannot be mistaken for a
+    full collection.
+    """
+    body_paths, deleted = impact_scope_paths(impact)
+    extra = [_normalize_rel(path) for path in (paths or []) if not _json_source_path(path)]
+    wanted = {path for path in (*body_paths, *extra) if path}
+    files = {path: body for path, body in dump_files(dump) if path in wanted}
+    identity = dump_identity(dump)
+    body_bytes = sum(len(body) for body in files.values())
+    out: list[str] = ["INCREMENTAL DUMP"]
+    if identity.get("REPOSITORY"):
+        out += [SEPARATOR, f"REPOSITORY: {identity['REPOSITORY']}", SEPARATOR, ""]
+    for key in ("SOURCE", "REQUESTED_REF", "REF", "COMMIT"):
+        if identity.get(key):
+            out.append(f"{key}: {identity[key]}")
+    out += [
+        f"FILES INCLUDED: {len(files)}",
+        f"CONTENT BYTES: {body_bytes}",
+        "",
+        "INCREMENTAL SCOPE",
+        RULE,
+        "",
+        f"SCOPED FILES: {len(wanted)}",
+        f"BODIES INCLUDED: {len(files)}",
+    ]
+    if wanted:
+        out.append("SCOPE PATHS: " + ", ".join(sorted(wanted)))
+    else:
+        out.append("SCOPE PATHS: (none)")
+    if deleted:
+        out += ["", "DELETED FILES", RULE, ""]
+        out.extend(deleted)
+    for path in sorted(files):
+        out += ["", SEPARATOR, f"FILE: {path}", SEPARATOR, "", files[path].rstrip("\n"), ""]
+    scoped = "\n".join(out).rstrip() + "\n"
+    return sanitize(scoped)
+
+
+def append_diffs(dump: str, diffs: list | None, max_chars: int = MAX_DIFF_CHARS) -> str:
+    """Attach truncated git patches. Uses DIFF headers so they are not FILE bodies."""
+    rows = [row for row in (diffs or []) if isinstance(row, dict)]
+    if not rows:
+        return dump
+    out = [(dump or "").rstrip(), "", "GIT DIFFS", RULE, ""]
+    for item in rows:
+        path = _normalize_rel(str(item.get("path") or ""))
+        patch = str(item.get("patch") or "")
+        if len(patch) > max_chars:
+            patch = patch[:max_chars] + "\n... [diff truncated]\n"
+        patch = sanitize(patch)
+        if not path and not patch.strip():
+            continue
+        out.extend(["", SEPARATOR, f"DIFF: {path}", SEPARATOR, "", patch.rstrip("\n"), ""])
+    return "\n".join(out).rstrip() + "\n"
+
+
 def collect_into(
     source: str,
     ref: str = "",
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     local_root: str | None = None,
+    paths: list[str] | None = None,
 ) -> Collection:
     """Collect `source` into a Collection. Raises CollectorError on failure."""
     source = (source or "").strip()
@@ -612,6 +787,9 @@ def collect_into(
         raise CollectorError("no repository was provided", status=400)
 
     host, name = source_identity(source)
+    wanted = None
+    if paths is not None:
+        wanted = {_normalize_rel(str(path)) for path in paths if _normalize_rel(str(path))}
 
     if is_remote(source):
         validate_remote_url(source)
@@ -627,7 +805,7 @@ def collect_into(
                 requested_ref=ref,
                 resolved_ref=ref or branch,
                 commit=commit,
-                entries=scan(repo_dir, max_file_bytes, max_total_bytes),
+                entries=scan(repo_dir, max_file_bytes, max_total_bytes, paths=wanted),
             )
 
     repo_dir = os.path.abspath(os.path.expanduser(source))
@@ -653,7 +831,7 @@ def collect_into(
                 requested_ref=ref,
                 resolved_ref=ref or branch,
                 commit=commit,
-                entries=scan(checked_out, max_file_bytes, max_total_bytes),
+                entries=scan(checked_out, max_file_bytes, max_total_bytes, paths=wanted),
             )
 
     commit, branch = _git_metadata(repo_dir)
@@ -664,7 +842,7 @@ def collect_into(
         requested_ref=ref,
         resolved_ref=ref or branch,
         commit=commit,
-        entries=scan(repo_dir, max_file_bytes, max_total_bytes),
+        entries=scan(repo_dir, max_file_bytes, max_total_bytes, paths=wanted),
     )
 
 
@@ -674,6 +852,7 @@ def collect(
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     local_root: str | None = None,
+    paths: list[str] | None = None,
 ) -> str:
     """Collect `source` (remote URL or local path) into a deterministic text dump."""
-    return render(collect_into(source, ref, max_file_bytes, max_total_bytes, local_root))
+    return render(collect_into(source, ref, max_file_bytes, max_total_bytes, local_root, paths))

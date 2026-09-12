@@ -12,6 +12,7 @@ values.local.yaml
 out/
 state/
 *.tgz
+docs/system-overview.md
 
 # Python
 __pycache__/

@@ -54,7 +54,7 @@ def validate_repository_url(repository_url: str) -> str:
     if parts.query or parts.fragment:
         raise ValidationError("repository URL must not include a query string or fragment")
 
-    host = (parts.hostname or "").lower()
+    host = _canonical_host(parts.hostname)
     if not host:
         raise ValidationError("repository URL must include a host")
 
@@ -84,7 +84,7 @@ def validate_repository_url(repository_url: str) -> str:
     rebuilt_path = "/" + "/".join(segments)
     if git_suffix:
         rebuilt_path += ".git"
-    return urlunsplit((scheme, _netloc(parts), rebuilt_path, "", ""))
+    return urlunsplit((scheme, _netloc(parts, host), rebuilt_path, "", ""))
 
 
 def validate_commit_sha(value: str, *, required: bool = False) -> str:
@@ -138,12 +138,21 @@ def _is_local_path(raw: str) -> bool:
     return False
 
 
+def _canonical_host(host: str | None) -> str:
+    """Strip a leading www. so github.com and www.github.com are the same repo."""
+    value = (host or "").lower()
+    if value.startswith("www."):
+        return value[4:]
+    return value
+
+
 def _is_github_host(host: str) -> bool:
+    host = _canonical_host(host)
     return host == "github.com" or host.endswith(".github.com")
 
 
-def _netloc(parts) -> str:
-    host = (parts.hostname or "").lower()
+def _netloc(parts, host: str | None = None) -> str:
+    host = _canonical_host(host if host is not None else parts.hostname)
     if ":" in host:
         host = f"[{host}]"
     if parts.port:

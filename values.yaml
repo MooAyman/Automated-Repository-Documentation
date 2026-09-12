@@ -14,7 +14,7 @@ collector:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-collector
-    tag: m12
+    tag: m17
     # Docker Desktop Kubernetes caches :latest; bump this tag when the image changes.
     pullPolicy: IfNotPresent
   # Disk budget for transient clones (mounted at /tmp).
@@ -60,7 +60,7 @@ analyzer:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-analyzer
-    tag: m2
+    tag: m4
     pullPolicy: IfNotPresent
   workspaceSizeLimit: 64Mi
   resources:
@@ -81,7 +81,7 @@ mapper:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-repository-map
-    tag: m2
+    tag: m4
     pullPolicy: IfNotPresent
   workspaceSizeLimit: 64Mi
   resources:
@@ -101,7 +101,7 @@ renderer:
   replicas: 1
   image:
     repository: localhost:5000/repository-documentation-documentation-renderer
-    tag: m5
+    tag: m9
     pullPolicy: IfNotPresent
   workspaceSizeLimit: 64Mi
   output:
@@ -112,7 +112,7 @@ renderer:
     #   docker run -d --name documentation-renderer-host --restart=unless-stopped
     #     -p 18080:8080 -e OUTPUT_DIR=/mnt/output
     #     -v C:\Users\moham\source\repos\repository-documentation\out:/mnt/output
-    #     localhost:5000/repository-documentation-documentation-renderer:m5
+    #     localhost:5000/repository-documentation-documentation-renderer:m8
     # The in-cluster Service keeps the Tool URL unchanged.
     hostDocker: true
     # Host bind path for that docker run. Not interpolated by Helm templates.

@@ -4,11 +4,10 @@
 # tool in the same turn: ARK 0.1.68 treats Agent.spec.outputSchema as that
 # Agent's final response.
 #
-# Pipeline contract: pass documentationJson (the Agent JSON string). The HTTP
-# body wraps it as the documentation object and always persists the HTML file.
-# If documentationJson is omitted, the nested documentation object is a
-# template fallback (printf-expanded maps; ARK HTTP bodies do not JSON-encode
-# maps).
+# Pipeline contract: pass the nested documentation object (the six outputSchema
+# fields) plus repositoryName. The HTTP body printf-quotes each string field so
+# the body stays valid JSON even if a field is truncated. Do not pass one
+# documentationJson blob; interpolating a truncated JSON string yields HTTP 400.
 apiVersion: ark.mckinsey.com/v1alpha1
 kind: Tool
 metadata:
@@ -19,25 +18,18 @@ metadata:
 spec:
   type: http
   description: >-
-    Renders structured repository documentation JSON as a standalone HTML
-    document. The pipeline passes documentationJson from the documentation
-    Agent; that JSON is sent as the documentation object. Does not call a
-    language model.
+    Renders structured repository documentation as a standalone HTML
+    document. The pipeline passes the nested documentation object from the
+    documentation Agent. Does not call a language model.
   inputSchema:
     type: object
     additionalProperties: false
     properties:
-      documentationJson:
-        type: string
-        description: >-
-          The complete structured documentation JSON as a JSON string, exactly
-          as returned by the repository-documentation agent. This is the
-          pipeline contract. Do not summarise or rewrite it.
       persist:
         type: boolean
         description: >-
-          Unused by the pipeline HTTP body. The documentationJson path always
-          writes the HTML artifact and returns JSON {filename, path, bytes}
+          Unused by the pipeline HTTP body. The nested documentation path
+          always writes the HTML artifact and returns JSON {filename, path, bytes}
           (the body template sets persist true).
       repositoryName:
         type: string
@@ -47,9 +39,9 @@ spec:
       documentation:
         type: object
         description: >-
-          Fallback six-section document when documentationJson is omitted.
-          Same shape as the documentation Agent outputSchema. Not used by
-          the pipeline.
+          Six-section document from the documentation Agent. Same shape as
+          that Agent's outputSchema. Pass these fields; do not wrap them in
+          a JSON string.
         additionalProperties: false
         required:
           - repositoryOverview
@@ -119,4 +111,4 @@ spec:
         value:
           value: application/json
     body: |
-      {{if .input.documentationJson}}{"documentation": {{.input.documentationJson}}, "persist": true, "repositoryName": {{if .input.repositoryName}}{{printf "%q" .input.repositoryName}}{{else}}""{{end}}}{{else}}{"documentation":{"repositoryOverview":{"summary":{{printf "%q" .input.documentation.repositoryOverview.summary}},"quickStart":{{printf "%q" .input.documentation.repositoryOverview.quickStart}}},"repositoryStructure":{{printf "%q" .input.documentation.repositoryStructure}},"toolsAndTechnologies":{{printf "%q" .input.documentation.toolsAndTechnologies}},"coreConceptsAndArchitecture":{"summary":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.summary}},"requestFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.requestFlow}},"buildAndPackagingFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.buildAndPackagingFlow}}},"categorizedTechnicalInformation":{"mainApisAndEndpoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainApisAndEndpoints}},"mainServicesAndMediators":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainServicesAndMediators}},"dtosSchemasMetadata":{{printf "%q" .input.documentation.categorizedTechnicalInformation.dtosSchemasMetadata}},"securityComponents":{{printf "%q" .input.documentation.categorizedTechnicalInformation.securityComponents}},"configurations":{{printf "%q" .input.documentation.categorizedTechnicalInformation.configurations}},"entryPoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.entryPoints}},"tests":{{printf "%q" .input.documentation.categorizedTechnicalInformation.tests}},"risksAndTechnicalDebt":{{printf "%q" .input.documentation.categorizedTechnicalInformation.risksAndTechnicalDebt}}},"developerOnboardingGuide":{"first30Minutes":{{printf "%q" .input.documentation.developerOnboardingGuide.first30Minutes}},"howToInvestigateAProductionBug":{{printf "%q" .input.documentation.developerOnboardingGuide.howToInvestigateAProductionBug}},"criticalFiles":{{printf "%q" .input.documentation.developerOnboardingGuide.criticalFiles}},"commonMistakes":{{printf "%q" .input.documentation.developerOnboardingGuide.commonMistakes}}}}}{{end}}
+      {"documentation":{"repositoryOverview":{"summary":{{printf "%q" .input.documentation.repositoryOverview.summary}},"quickStart":{{printf "%q" .input.documentation.repositoryOverview.quickStart}}},"repositoryStructure":{{printf "%q" .input.documentation.repositoryStructure}},"toolsAndTechnologies":{{printf "%q" .input.documentation.toolsAndTechnologies}},"coreConceptsAndArchitecture":{"summary":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.summary}},"requestFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.requestFlow}},"buildAndPackagingFlow":{{printf "%q" .input.documentation.coreConceptsAndArchitecture.buildAndPackagingFlow}}},"categorizedTechnicalInformation":{"mainApisAndEndpoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainApisAndEndpoints}},"mainServicesAndMediators":{{printf "%q" .input.documentation.categorizedTechnicalInformation.mainServicesAndMediators}},"dtosSchemasMetadata":{{printf "%q" .input.documentation.categorizedTechnicalInformation.dtosSchemasMetadata}},"securityComponents":{{printf "%q" .input.documentation.categorizedTechnicalInformation.securityComponents}},"configurations":{{printf "%q" .input.documentation.categorizedTechnicalInformation.configurations}},"entryPoints":{{printf "%q" .input.documentation.categorizedTechnicalInformation.entryPoints}},"tests":{{printf "%q" .input.documentation.categorizedTechnicalInformation.tests}},"risksAndTechnicalDebt":{{printf "%q" .input.documentation.categorizedTechnicalInformation.risksAndTechnicalDebt}}},"developerOnboardingGuide":{"first30Minutes":{{printf "%q" .input.documentation.developerOnboardingGuide.first30Minutes}},"howToInvestigateAProductionBug":{{printf "%q" .input.documentation.developerOnboardingGuide.howToInvestigateAProductionBug}},"criticalFiles":{{printf "%q" .input.documentation.developerOnboardingGuide.criticalFiles}},"commonMistakes":{{printf "%q" .input.documentation.developerOnboardingGuide.commonMistakes}}}},"persist": true, "repositoryName": {{if .input.repositoryName}}{{printf "%q" .input.repositoryName}}{{else}}""{{end}}}

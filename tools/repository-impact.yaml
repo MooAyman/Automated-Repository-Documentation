@@ -1,0 +1,48 @@
+# ARK Tool: deterministic incremental analysis scope.
+#
+# Called by Agent/repository-documentation after /changes, analyzer, and map.
+# Accepts already-computed JSON only. Does not clone, parse source, or call a model.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Tool
+metadata:
+  name: repository-impact
+  labels:
+    project: repository-documentation
+    component: tool
+spec:
+  type: http
+  description: >-
+    Deterministic incremental analysis scope from repository-changes JSON plus
+    analyzer/map evidence. Returns changed files, one-hop affected dependents,
+    and affected symbols/modules. Pass changesJson and analysisJson or
+    repositoryMapJson, unchanged. Do not pass a repository URL or source.
+    Does not infer architecture. The collector dump remains the source of truth.
+  inputSchema:
+    type: object
+    additionalProperties: false
+    properties:
+      changesJson:
+        type: string
+        description: >-
+          The complete repository-changes JSON as a JSON string, exactly as
+          returned by repository-changes.
+      analysisJson:
+        type: string
+        description: >-
+          Optional repository-analyzer JSON as a JSON string. Used when
+          repositoryMapJson is not provided.
+      repositoryMapJson:
+        type: string
+        description: >-
+          Optional repository-map JSON as a JSON string, exactly as returned
+          by repository-map.
+  http:
+    url: http://repository-map.default.svc.cluster.local:8080/impact
+    method: POST
+    timeout: 60s
+    headers:
+      - name: Content-Type
+        value:
+          value: application/json
+    body: |
+      {"changes": {{if .input.changesJson}}{{.input.changesJson}}{{else}}{"changed":[]}{{end}}, "analysis": {{if .input.analysisJson}}{{.input.analysisJson}}{{else}}{}{{end}}, "repositoryMap": {{if .input.repositoryMapJson}}{{.input.repositoryMapJson}}{{else}}{}{{end}}}

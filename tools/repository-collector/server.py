@@ -9,11 +9,13 @@ Standard library only - no web framework is needed for three endpoints.
 
 Request body for /collect (JSON):
     {"repository": "<url or local path>", "ref": "<optional branch/tag>",
-     "max_file_bytes": 80000, "max_total_bytes": 209715200}
+     "max_file_bytes": 80000, "max_total_bytes": 209715200,
+     "paths": ["optional", "relative", "paths"]}
 
 Request body for /changes (JSON):
     {"repository": "<url or local path>", "ref": "<optional new ref>",
-     "previousCommit": "<optional SHA>", "newCommit": "<optional SHA>"}
+     "previousCommit": "<optional SHA>", "newCommit": "<optional SHA>",
+     "includeDiffs": false}
 """
 
 from __future__ import annotations
@@ -103,6 +105,10 @@ class Handler(BaseHTTPRequestHandler):
         ref = str(payload.get("ref") or "").strip()
         max_file_bytes = _positive_int(payload.get("max_file_bytes"), DEFAULT_MAX_FILE_BYTES)
         max_total_bytes = _positive_int(payload.get("max_total_bytes"), DEFAULT_MAX_TOTAL_BYTES)
+        raw_paths = payload.get("paths")
+        paths = None
+        if isinstance(raw_paths, list):
+            paths = [str(item) for item in raw_paths]
 
         if not repository:
             self._respond(400, "field 'repository' is required (a git URL or a local path)")
@@ -123,6 +129,7 @@ class Handler(BaseHTTPRequestHandler):
                 max_file_bytes=max_file_bytes,
                 max_total_bytes=max_total_bytes,
                 local_root=LOCAL_REPO_ROOT,
+                paths=paths,
             )
         except CollectorError as exc:
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -181,6 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         ref = str(payload.get("ref") or "").strip()
         previous = str(payload.get("previousCommit") or "").strip()
         new_commit = str(payload.get("newCommit") or "").strip()
+        include_diffs = bool(payload.get("includeDiffs") or payload.get("include_diffs"))
         if not repository:
             self._respond(400, "field 'repository' is required (a git URL or a local path)")
             return
@@ -202,6 +210,7 @@ class Handler(BaseHTTPRequestHandler):
                 ref=ref,
                 new_commit=new_commit,
                 local_root=LOCAL_REPO_ROOT,
+                include_diffs=include_diffs,
             )
         except CollectorError as exc:
             elapsed_ms = int((time.monotonic() - started) * 1000)

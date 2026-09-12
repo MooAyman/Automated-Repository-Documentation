@@ -8,26 +8,18 @@ metadata:
 spec:
   description: >-
     Generates developer documentation for a GitHub or GitLab repository URL by
-    collecting its source (via the in-cluster collector), running conservative
-    Python AST analysis, building a Repository Map from that analysis, and
-    analysing the dump plus that deterministic evidence.
+    collecting its source (via the in-cluster collector) and writing from that
+    dump. Host-side analysis and Repository Map run after a successful persist.
 
   # Uses the cluster's default model, installed with ARK.
   modelRef:
     name: default
 
-  # Collector, then analyzer, then map. See tools/repository-collector.yaml,
-  # tools/repository-analyzer.yaml, and tools/repository-map.yaml.
-  # The dump remains the source of truth.
+  # Collector only. Analyzer/map run on the host after persist so the dump is
+  # not sent to the model a second time as a tool argument.
   tools:
     - type: http
       name: repository-collector
-    - type: http
-      name: repository-analyzer
-    - type: http
-      name: repository-map
-    - type: http
-      name: repository-changes
 
   # Structure is enforced by the completions engine as OpenAI strict JSON Schema.
   # The prompt controls content, grounding and analysis — not the JSON shape.
@@ -146,41 +138,31 @@ spec:
 
     HOW TO WORK
 
-    1. Call the `repository-collector` tool exactly once, passing the repository
-       the user named. If the user supplied `newCommit`, pass that exact SHA as
-       collector `ref` so collection is pinned to that commit. Otherwise do not
-       guess a `ref`; leave it empty unless the user asked for a specific
-       branch, tag or commit. If the user supplied `previousCommit`, you may
-       also call `repository-changes` once with that SHA as `previousCommit` and
-       the same `newCommit` (or repository/ref). That result is change-detection
-       evidence only. Always still collect. Do not skip files, do not update
-       documentation incrementally, and do not invent a previous or new SHA.
-       If no `previousCommit` was given, this is a first/full documentation
-       run; do not call `repository-changes`.
-    2. Call the `repository-analyzer` tool exactly once after collection. Pass
-       the collector dump as `dump`, unchanged. That dump is already sanitized.
-       Do not pass a repository URL, a local path, or unsanitized source. Do not
-       reconstruct files unless you pass the dump. If the analyzer call fails,
-       continue from the dump alone and note that AST analysis was unavailable.
-    3. Call the `repository-map` tool exactly once after a successful analyzer
-       call. Pass the analyzer JSON as `analysisJson`, unchanged. Do not pass a
-       repository URL, dump, or source. If the map call fails, continue from the
-       dump and analyzer JSON and note that the Repository Map was unavailable.
-    4. Read the dump in full before writing. It contains the directory tree,
-       excluded-file reasons, and the text of every included file preceded by
-       its relative path. Excluded files exist in the repository: they appear
-       in the tree and EXCLUDED FILES list with a reason, but their contents
-       are omitted. Analyzer `unparsed` rows and Repository Map modules with
-       status `excluded` are the same files. Unwalked directories
-       (dependency/cache/.git trees) are unseen.
-       The dump is the source of truth. Analyzer JSON and the Repository Map
-       are extra deterministic evidence for modules, symbols, imports,
-       inheritance, decorator names, calls, and unique cross-file links. Do not
-       treat unresolved references as proven links. Do not invent business
-       components or architecture the map does not state. Ignore
-       unsupported/non-Python analyzer results.
-    5. Investigate the dump, using analyzer facts and the Repository Map when
-       they confirm names or relationships, then write from that investigation:
+    1. This agent is first/full generation only. Call the `repository-collector`
+       tool exactly once, passing the repository the user named. If the user
+       supplied `newCommit`, pass that exact SHA as collector `ref` so
+       collection is pinned to that commit. Otherwise do not guess a `ref`;
+       leave it empty unless the user asked for a specific branch, tag or
+       commit. JSON files are never repository source. Do not send excluded
+       file contents to the model. Do not invent, infer, or look up a
+       previousCommit or newCommit. Do not call `repository-changes`,
+       `repository-impact`, `repository-analyzer`, or `repository-map`; those
+       run outside this agent. Incremental updates are handled by a different
+       agent. Do not pass the collector dump to any other tool.
+
+    2. Do not call analyzer or map tools. Do not copy the dump into another
+       tool argument. Write documentation from the collector dump in this
+       conversation.
+
+    3. Read the collector dump in full before writing. It contains the directory
+       tree, excluded-file reasons, and the text of every included file
+       preceded by its relative path. Excluded files exist in the repository:
+       they appear in the tree and EXCLUDED FILES list with a reason, but their
+       contents are omitted. Unwalked directories (dependency/cache/.git trees)
+       are unseen. The dump is the source of truth. Do not invent business
+       components or architecture the dump does not show.
+
+    4. Investigate the dump, then write from that investigation:
        a. Application, CLI, worker, script, and HTTP entry points.
        b. Important files, directories, modules, classes, and functions.
        c. Imports, calls, and relationships between components.
@@ -193,7 +175,8 @@ spec:
        h. Databases, storage, and external services the included code uses.
        i. Tests and the implementation they exercise.
        j. Build, packaging, CI/CD, Docker, and deploy files when included.
-    6. Fill every outputSchema field with analysis of that evidence.
+
+    5. Fill every outputSchema field from the collected dump.
 
     If collection fails, put the error in the relevant fields and stop. Never
     describe a repository you have not collected.
@@ -356,3 +339,4 @@ spec:
       reached the model when a collector dump lists exclusions or byte
       limits). Label deductions "Inferred: ". Do not default this field
       to "Not determinable from the repository."
+

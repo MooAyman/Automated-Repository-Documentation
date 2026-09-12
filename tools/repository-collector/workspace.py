@@ -1,8 +1,9 @@
-"""Short-lived clone reuse for one pipeline pair of /changes and /collect.
+"""Short-lived clone reuse for sequential collector requests.
 
-Not a general cache. A workspace is reused only for the same repository
-identity and the same ref/commit, and only while a request is using it or
-during a brief grace period so the next sequential call can attach.
+Not a general cache. A workspace is reused for the same repository
+identity while a request is using it or during a brief grace period.
+An idle workspace may be fetched/checked out to another SHA of the
+same repository. HEAD is never moved while another request holds it.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Iterator
 
 import collector
 
-GRACE_SECONDS = float(os.environ.get("WORKSPACE_GRACE_SECONDS", "90"))
+GRACE_SECONDS = float(os.environ.get("WORKSPACE_GRACE_SECONDS", "180"))
 _ROOT = os.path.join(tempfile.gettempdir(), "repository-collector-workspaces")
 _lock = threading.RLock()
 _workspaces: dict[tuple[str, str], "_Workspace"] = {}
@@ -137,6 +138,30 @@ def _lookup(url: str, ref: str, commit: str) -> _Workspace | None:
     return None
 
 
+def _idle_same_url(url: str) -> _Workspace | None:
+    """An unused, valid clone of this repository. HEAD may still need moving."""
+    for item in _workspaces.values():
+        if item.url == url and item.refcount == 0 and _is_valid(item):
+            return item
+    return None
+
+
+def _rekey(item: _Workspace, new_key: tuple[str, str]) -> bool:
+    """Move item to new_key. False if another request currently holds that key."""
+    existing = _workspaces.get(new_key)
+    if existing is not None and existing is not item and existing.refcount > 0:
+        return False
+    old_key = item.key
+    if old_key != new_key and _workspaces.get(old_key) is item:
+        _workspaces.pop(old_key, None)
+    if existing is not None and existing is not item:
+        _workspaces.pop(new_key, None)
+        _remove(existing.path)
+    _workspaces[new_key] = item
+    item.key = new_key
+    return True
+
+
 def acquire(source: str, ref: str = "", commit: str = "") -> _Workspace:
     """Return a workspace for this repository/ref, cloning only when needed."""
     collector.validate_remote_url(source)
@@ -144,9 +169,23 @@ def acquire(source: str, ref: str = "", commit: str = "") -> _Workspace:
     ref = (ref or "").strip()
     commit = (commit or "").strip()
     key = (url, ref)
+    spec = commit or ref
     with _lock:
         _expire_unlocked(time.time())
         item = _lookup(url, ref, commit)
+        dest = _workspaces.get(key)
+        dest_busy = dest is not None and dest.refcount > 0
+        if item is None and spec and not dest_busy:
+            idle = _idle_same_url(url)
+            if idle is not None:
+                try:
+                    new_head = checkout_commit(idle.path, spec, source)
+                    if _rekey(idle, key):
+                        idle.head = new_head
+                        idle.ref = ref
+                        item = idle
+                except collector.CollectorError:
+                    item = None
         if item is None:
             occupied = _workspaces.get(key)
             if occupied is not None and occupied.refcount == 0:
@@ -254,8 +293,7 @@ def checkout_commit(repo_dir: str, spec: str, source: str, url: str = "") -> str
 
 
 def has_commit(repo_dir: str, spec: str) -> bool:
-    result = collector._run_git(["rev-parse", "--verify", f"{spec}^{{commit}}"], cwd=repo_dir)
-    return result.returncode == 0 and bool((result.stdout or "").strip())
+    return bool(_rev_parse(repo_dir, spec))
 
 
 def ensure_commit(repo_dir: str, spec: str, source: str, url: str = "") -> str:
@@ -263,29 +301,61 @@ def ensure_commit(repo_dir: str, spec: str, source: str, url: str = "") -> str:
 
     Does not check out the fetched commit. Does not apply the collection budget.
     """
-    if has_commit(repo_dir, spec):
-        return _resolve(repo_dir, spec, source, url)
+    resolved = _rev_parse(repo_dir, spec, url)
+    if resolved:
+        return resolved
     _fetch_commit(repo_dir, spec, source, url)
-    if not has_commit(repo_dir, spec):
-        raise collector.CollectorError(
-            f"Requested ref not found: '{spec}' does not exist in {collector.redact(collector.strip_userinfo(source))}",
-            status=404,
-        )
-    return _resolve(repo_dir, spec, source, url)
-
-
-def _resolve(repo_dir: str, spec: str, source: str, url: str = "") -> str:
-    result = collector._run_git(
-        ["rev-parse", "--verify", f"{spec}^{{commit}}"],
+    resolved = _rev_parse(repo_dir, spec, url)
+    if resolved:
+        return resolved
+    fetched = collector._run_git(
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         cwd=repo_dir,
         url=url,
     )
-    if result.returncode != 0 or not (result.stdout or "").strip():
+    sha = (fetched.stdout or "").strip() if fetched.returncode == 0 else ""
+    if sha:
+        return sha
+    raise collector.CollectorError(
+        f"Requested ref not found: '{spec}' does not exist in {collector.redact(collector.strip_userinfo(source))}",
+        status=404,
+    )
+
+
+def _rev_parse(repo_dir: str, spec: str, url: str = "") -> str:
+    spec = (spec or "").strip()
+    if not spec:
+        return ""
+    names = [spec]
+    if not collector._SHA_RE.match(spec):
+        names.extend(
+            [
+                f"refs/heads/{spec}",
+                f"refs/tags/{spec}",
+                f"refs/remotes/origin/{spec}",
+                f"origin/{spec}",
+            ]
+        )
+    for name in names:
+        result = collector._run_git(
+            ["rev-parse", "--verify", f"{name}^{{commit}}"],
+            cwd=repo_dir,
+            url=url,
+        )
+        sha = (result.stdout or "").strip() if result.returncode == 0 else ""
+        if sha:
+            return sha
+    return ""
+
+
+def _resolve(repo_dir: str, spec: str, source: str, url: str = "") -> str:
+    resolved = _rev_parse(repo_dir, spec, url)
+    if not resolved:
         raise collector.CollectorError(
             f"Requested ref not found: '{spec}' does not exist in {collector.redact(collector.strip_userinfo(source))}",
             status=404,
         )
-    return result.stdout.strip()
+    return resolved
 
 
 def _fetch_commit(repo_dir: str, spec: str, source: str, url: str = "") -> None:
@@ -295,23 +365,39 @@ def _fetch_commit(repo_dir: str, spec: str, source: str, url: str = "") -> None:
             f"Requested ref not found: '{spec}' is not in this checkout and cannot be fetched",
             status=404,
         )
-    fetch = collector._run_git(
+    attempts = [
         ["fetch", "--depth", "1", "--no-tags", "origin", spec],
-        cwd=repo_dir,
-        url=origin,
-    )
-    if fetch.returncode == 0:
-        return
-    fetch = collector._run_git(
         ["fetch", "--no-tags", "origin", spec],
-        cwd=repo_dir,
-        url=origin,
-    )
-    if fetch.returncode != 0:
-        raise collector.CollectorError(
-            f"Requested ref not found: '{spec}' does not exist in {collector.redact(collector.strip_userinfo(source))}",
-            status=404,
+    ]
+    if not collector._SHA_RE.match(spec):
+        attempts.extend(
+            [
+                [
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "--no-tags",
+                    "origin",
+                    f"+refs/heads/{spec}:refs/remotes/origin/{spec}",
+                ],
+                [
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "--no-tags",
+                    "origin",
+                    f"+refs/tags/{spec}:refs/tags/{spec}",
+                ],
+            ]
         )
+    for args in attempts:
+        fetch = collector._run_git(args, cwd=repo_dir, url=origin)
+        if fetch.returncode == 0:
+            return
+    raise collector.CollectorError(
+        f"Requested ref not found: '{spec}' does not exist in {collector.redact(collector.strip_userinfo(source))}",
+        status=404,
+    )
 
 
 def _ensure_root() -> str:

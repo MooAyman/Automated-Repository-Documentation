@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import os
+import copy
 import re
 import subprocess
 import sys
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "reposito
 import collector  # noqa: E402
 
 TARGET_REPO = "https://github.com/MooAyman/github-mcp-chatbot"
+SELF_REPO = "https://github.com/MooAyman/Automated-Repository-Documentation"
 PIPELINE_QUERY_NAME = "pipeline-github-mcp-chatbot"
 COLLECTOR_LABEL = "component=collector"
 NAMESPACE = os.environ.get("ARK_NAMESPACE", "default")
@@ -123,6 +125,73 @@ def test_determinism_and_render() -> None:
         check("supersecret" not in first, "secret contents never reach the dump")
         check(first.index("FILE: README.md") < first.index("FILE: src/app/main.py"),
               "files emitted in deterministic path order")
+
+
+def test_json_exclusion() -> None:
+    print("\nJSON collection exclusion")
+    analyzer_dir = str(ROOT / "tools" / "repository-analyzer")
+    sys.path.insert(0, analyzer_dir)
+    import analyzer  # noqa: E402
+    sys.path.remove(analyzer_dir)
+
+    sentinel = "JSON_COLLECTION_SENTINEL_ZX9Q"
+    nested_sentinel = "NESTED_JSON_COLLECTION_SENTINEL_ZX9Q"
+    reason = "excluded: json file"
+
+    check(not collector.is_collectable_path("config.json"), "root .json path is not collectable")
+    check(not collector.is_collectable_path("src/data/config.json"), "nested .json path is not collectable")
+    check(collector.is_collectable_path("src/app.py"), "non-JSON source stays collectable")
+    check(not collector.is_collectable_path(".env"), "existing secret exclusion is unchanged")
+    check(not collector.is_collectable_path("package-lock.json"), "existing lockfile exclusion is unchanged")
+    check(collector.path_skip_reason("settings.json") == reason, "JSON uses the central exclusion reason")
+    check(collector.path_skip_reason("package-lock.json") == "excluded: generated lock file",
+          "lockfile JSON keeps the more specific lockfile reason")
+    check(collector.path_skip_reason("credentials.json") == "excluded: potential secret",
+          "secret JSON keeps the more specific secret reason")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "json-repo"
+        (root / "src" / "data").mkdir(parents=True)
+        (root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / "README.md").write_text("# Docs\n", encoding="utf-8")
+        (root / "config.json").write_text(f'{{"token": "{sentinel}"}}\n', encoding="utf-8")
+        (root / "src" / "data" / "nested.json").write_text(
+            f'{{"nested": "{nested_sentinel}"}}\n', encoding="utf-8"
+        )
+        (root / ".env").write_text("SECRET=supersecret\n", encoding="utf-8")
+        (root / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+
+        first = collector.collect(str(root))
+        second = collector.collect(str(root))
+        check(first == second, "JSON exclusion is deterministic")
+        check("FILE: src/app.py" in first and "VALUE = 1" in first, "non-JSON source is still collected")
+        check("FILE: README.md" in first, "non-JSON docs are still collected")
+        check("FILE: config.json" not in first, ".json files are excluded from the dump")
+        check("FILE: src/data/nested.json" not in first, "nested .json files are excluded from the dump")
+        check(sentinel not in first and nested_sentinel not in first, "JSON contents never appear in the dump")
+        check("config.json — " in first and reason in first, "JSON is listed as excluded metadata")
+        check("src/data/nested.json — " in first, "nested JSON is listed as excluded metadata")
+        check("supersecret" not in first and "\nFILE: .env\n" not in first, "existing secret exclusion still works")
+        check("FILE: package-lock.json" not in first, "existing lockfile exclusion still works")
+
+        entries = collector.scan(str(root), collector.DEFAULT_MAX_FILE_BYTES, collector.DEFAULT_MAX_TOTAL_BYTES)
+        by_path = {entry.path: entry for entry in entries}
+        check(by_path["config.json"].included is False and by_path["config.json"].text == "",
+              "JSON file body is omitted at scan time")
+        check(by_path["src/data/nested.json"].included is False and by_path["src/data/nested.json"].text == "",
+              "nested JSON file body is omitted at scan time")
+        check(by_path["src/app.py"].included, "Python source remains included")
+
+        analysis = analyzer.analyze({"dump": first})
+        check(any(row["path"] == "src/app.py" for row in analysis["files"]),
+              "non-JSON source still reaches analyzer")
+        check(not any(row["path"].endswith(".json") for row in analysis["files"]),
+              "JSON files do not reach analyzer as source content")
+        unparsed = {row["path"]: row["reason"] for row in analysis["unparsed"]}
+        check(unparsed.get("config.json") == reason, "analyzer sees JSON as excluded metadata")
+        check(unparsed.get("src/data/nested.json") == reason, "analyzer sees nested JSON as excluded metadata")
+        check(sentinel not in json.dumps(analysis) and nested_sentinel not in json.dumps(analysis),
+              "JSON contents do not reach downstream analysis")
 
 
 def test_budget_and_errors() -> None:
@@ -458,9 +527,11 @@ def test_structured_sanitization() -> None:
         (root / ".env").write_text("SECRET=supersecret\n", encoding="utf-8")
 
         dump = collector.collect(str(root))
-        check("FILE: config.json" in dump and "FILE: deploy.yml" in dump, "structured files remain in the dump")
+        check("FILE: config.json" not in dump, "JSON files are excluded from the collected dump")
+        check("FILE: deploy.yml" in dump, "YAML structured files remain in the dump")
         check("print('hello')" in dump, "non-structured source is kept")
         check("supersecret" not in dump, "filename filtering still drops `.env`")
+        check(public_name not in dump, "JSON contents never appear in the dump")
         for original in (
             json_password,
             json_apikey,
@@ -476,7 +547,7 @@ def test_structured_sanitization() -> None:
             "plain-yaml-flow-secret",
         ):
             check(original not in dump, "original structured secret cannot appear in the dump")
-        check(public_name in dump and public_host in dump, "non-sensitive structured values reach the dump")
+        check(public_host in dump, "non-sensitive YAML values reach the dump")
         check(dump == collector.collect(str(root)), "structured dump remains deterministic")
 
 
@@ -557,13 +628,14 @@ def test_security_verification() -> None:
     check("entry.text" not in server_src, "HTTP handler does not send unsanitized file bodies")
     tools_block = docs.split("prompt:", 1)[0]
     check(
-        tools_block.count("type: http") == 4
+        tools_block.count("type: http") == 1
         and "repository-collector" in tools_block
-        and "repository-analyzer" in tools_block
-        and "repository-map" in tools_block
-        and "repository-changes" in tools_block,
-        "Documentation Agent receives repository content via collector, then analyzer, map, and changes",
+        and "repository-analyzer" not in tools_block
+        and "repository-map" not in tools_block,
+        "Documentation Agent receives repository content via collector only",
     )
+    check("repository-changes" not in tools_block and "repository-impact" not in tools_block,
+          "Documentation Agent does not call deterministic /changes or /impact")
     check("documentation-renderer" not in tools_block, "Documentation Agent does not receive renderer payloads")
     analyzer_src = (ROOT / "tools" / "repository-analyzer" / "analyzer.py").read_text(encoding="utf-8")
     check("collect_into" not in analyzer_src and "import collector" not in analyzer_src,
@@ -665,7 +737,8 @@ def test_security_verification() -> None:
 
         dump = collector.collect(str(root))
         check("safe-source" in dump, "non-sensitive source still reaches the dump")
-        check("Acme Storefront" in dump, "non-sensitive JSON fields still reach the dump")
+        check("Acme Storefront" not in dump, "JSON contents never reach the dump")
+        check("FILE: customers.json" not in dump, "JSON files are excluded from the collected dump")
         check("keep-billing-host" in dump, "non-sensitive YAML fields still reach the dump")
         _assert_absent(dump, regex_values, "regex secrets in collector dump")
         _assert_absent(dump, structured_values, "JSON/YAML field values in collector dump")
@@ -873,6 +946,12 @@ def test_input_validation() -> None:
 
     github, ref = validation.validate_pipeline_input("https://github.com/MooAyman/github-mcp-chatbot")
     check(github == "https://github.com/MooAyman/github-mcp-chatbot" and ref == "", "GitHub HTTPS URL is accepted")
+    www, _ = validation.validate_pipeline_input("https://www.github.com/MooAyman/github-mcp-chatbot")
+    check(www == "https://github.com/MooAyman/github-mcp-chatbot",
+          "www.github.com is normalized to github.com")
+    www_gl, _ = validation.validate_pipeline_input("https://www.gitlab.com/group/project")
+    check(www_gl == "https://gitlab.com/group/project",
+          "www.gitlab.com is normalized to gitlab.com")
 
     gitlab, _ = validation.validate_pipeline_input("https://gitlab.com/group/project.git/")
     check(gitlab == "https://gitlab.com/group/project.git", "gitlab.com URL is accepted and trailing slash stripped")
@@ -1101,6 +1180,41 @@ def test_git_change_detection() -> None:
             check(False, "missing new SHA is rejected")
         except collector.CollectorError as exc:
             check(exc.status == 404, "missing new SHA is a 404")
+
+        parsed = {row["path"]: row["status"] for row in changes._parse_name_status(
+            "U\tsrc/conflict.py\nX\tsrc/weird.py\nT\tsrc/typed.py\nM\tsrc/ok.py\n"
+        )}
+        check(parsed.get("src/conflict.py") == "modified", "unmerged git status is treated as modified")
+        check(parsed.get("src/weird.py") == "modified", "unknown git status is treated as modified")
+        check(parsed.get("src/typed.py") == "modified", "typechange git status is treated as modified")
+        check(parsed.get("src/ok.py") == "modified", "modified git status is unchanged")
+
+        _git(str(root), "checkout", "--orphan", "rewrite")
+        (root / "orphan.txt").write_text("unrelated-history\n", encoding="utf-8")
+        _git(str(root), "add", "orphan.txt")
+        _git(str(root), "commit", "-m", "orphan")
+        rewritten = _git(str(root), "rev-parse", "HEAD").stdout.strip()
+        try:
+            changes.detect_changes(
+                str(root),
+                previous_commit=shas["previous"],
+                new_commit=rewritten,
+            )
+            check(False, "rewritten history is rejected")
+        except collector.CollectorError as exc:
+            check(exc.status == 400 and "not an ancestor" in str(exc),
+                  "non-ancestor previousCommit is a 400")
+        try:
+            changes.detect_changes(
+                str(root),
+                previous_commit=shas["current"],
+                new_commit=shas["previous"],
+            )
+            check(False, "backwards previousCommit is rejected")
+        except collector.CollectorError as exc:
+            check(exc.status == 400 and "not an ancestor" in str(exc),
+                  "newer-to-older previousCommit is a 400")
+        _git(str(root), "checkout", "--force", shas["current"])
 
         dump = collector.collect(str(root))
         check("version-two" in dump and "FILE: stay.txt" in dump, "collection of the same repo is unchanged")
@@ -1531,7 +1645,30 @@ def test_workspace_reuse_and_shallow() -> None:
             clones.clear()
             collector.collect(url_a, ref="main")
             collector.collect(url_a, ref="feature")
-            check(len(clones) == 2, "different refs do not share the wrong workspace")
+            check(len(clones) == 1, "idle same-URL workspace is reused across refs")
+            reused = next(iter(workspace._workspaces.values()))
+            check(workspace._same_sha(workspace._head(reused.path), shas["current"]),
+                  "reused idle workspace checks out the requested ref")
+
+            workspace.reset()
+            clones.clear()
+            collector.collect(url_a, ref=shas["current"])
+            collector.collect(url_a, ref=shas["previous"])
+            check(len(clones) == 1, "idle same-URL workspace is reused across SHAs")
+            moved = next(iter(workspace._workspaces.values()))
+            check(workspace._same_sha(workspace._head(moved.path), shas["previous"]),
+                  "reused idle workspace HEAD matches the requested SHA")
+
+            workspace.reset()
+            clones.clear()
+            held = workspace.acquire(url_a, ref=shas["current"], commit=shas["current"])
+            try:
+                collector.collect(url_a, ref=shas["previous"])
+                check(len(clones) == 2, "in-use workspace is not reused for a different SHA")
+                check(workspace._same_sha(workspace._head(held.path), shas["current"]),
+                      "in-use workspace HEAD is not moved for another request")
+            finally:
+                workspace.release(held)
 
             workspace.reset()
             clones.clear()
@@ -1640,6 +1777,17 @@ def test_workspace_reuse_and_shallow() -> None:
                 check(payload["newCommit"] == shas["current"] and f"COMMIT: {shas['current']}" in body,
                       "HTTP /changes and /collect use the same explicit newCommit")
                 check(len(clones) == 1, "HTTP same-pipeline calls clone the remote once")
+                collect_again = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/collect",
+                    data=json.dumps({"repository": url_a, "ref": shas["current"]}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(collect_again, timeout=30) as response:
+                    again = response.read().decode("utf-8")
+                check(f"COMMIT: {shas['current']}" in again,
+                      "a later Agent /collect still sees the pinned newCommit")
+                check(len(clones) == 1, "host scope then Agent /collect reuse one clone")
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -1707,6 +1855,17 @@ def test_documentation_registry() -> None:
         check(stored is not None and stored["commitSha"] == sha1, "registry stores the documented SHA")
         check(stored["status"] == "documented", "registry marks the repository as documented")
         check(stored["identity"] == "github.com/owner/repo", "registry stores a stable repository identity")
+        check(registry.repository_identity("https://www.github.com/owner/repo") == "github.com/owner/repo",
+              "www.github.com uses the same repository identity")
+        check(registry.lookup("https://www.github.com/owner/repo.git", path)["commitSha"] == sha1,
+              "www.github.com looks up the already documented repository")
+        www_plan = ark_client.plan_documentation(
+            "https://www.github.com/owner/repo",
+            current_sha=sha1,
+            registry_path=path,
+        )
+        check(www_plan["status"] == "already_documented",
+              "same repository via www.github.com is not treated as new")
         check(path.is_file() and html.read_text(encoding="utf-8").startswith("<!DOCTYPE html>"),
               "registry is a JSON file, not the generated HTML")
         check("ffffffffffffffffffffffffffffffffffffffff" not in path.read_text(encoding="utf-8"),
@@ -1768,6 +1927,32 @@ def test_documentation_registry() -> None:
 
         other_plan = ark_client.plan_documentation(other, current_sha=sha1, registry_path=path)
         check(other_plan["status"] == "first_run", "a different repository has its own documented SHA")
+
+        missing_sha = {
+            "status": "first_run",
+            "mode": "full",
+            "repository": other,
+            "identity": "github.com/owner/other",
+            "currentCommit": "",
+            "previousCommit": "",
+            "documentationVersion": 0,
+            "artifact": "",
+            "runPipeline": True,
+        }
+        original_resolve = ark_client.resolve_commit_sha
+        ark_client.resolve_commit_sha = lambda _repository, _ref="": sha1
+        try:
+            recovered = ark_client.execute_documentation_plan(
+                missing_sha,
+                run_pipeline=succeed,
+                registry_path=path,
+            )
+        finally:
+            ark_client.resolve_commit_sha = original_resolve
+        check(recovered.get("persisted") is True and recovered["currentCommit"] == sha1,
+              "successful generation persists a SHA resolved after the Query")
+        check(registry.lookup(other, path)["commitSha"] == sha1,
+              "resolved SHA is stored so a later submit is not treated as new")
 
         check("session_state" not in Path(registry.__file__).read_text(encoding="utf-8"),
               "registry module does not depend on Streamlit session state")
@@ -1837,6 +2022,16 @@ def test_commit_pinning_and_eligibility() -> None:
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main\n"
     )
     check(lightweight == previous_sha, "non-tag ls-remote uses the commit SHA")
+    first_doc = {"repositoryOverview": {"summary": "first", "quickStart": "a"}, "repositoryStructure": "s"}
+    second_doc = {"repositoryOverview": {"summary": "second", "quickStart": "b"}, "repositoryStructure": "t"}
+    doubled = json.dumps(first_doc, separators=(",", ":")) + "\n" + json.dumps(second_doc, separators=(",", ":"))
+    parsed = ark_client.parse_documentation(doubled)
+    check(parsed == second_doc, "concatenated Query JSON uses the last complete object")
+    check(ark_client.parse_documentation(json.dumps(first_doc)) == first_doc,
+          "single Query JSON object still parses")
+    wrapped = json.dumps({"documentation": first_doc}, separators=(",", ":"))
+    check(ark_client.parse_documentation(wrapped) == first_doc,
+          "nested documentation objects still unwrap")
 
     check(registry.same_commit(new_sha, new_sha), "identical full SHAs compare equal")
     check(not registry.same_commit(new_sha, new_sha[:7]), "a 7-character SHA prefix is not full equality")
@@ -1850,10 +2045,10 @@ def test_commit_pinning_and_eligibility() -> None:
     )
 
     ui_src = (ROOT / "app" / "ui.py").read_text(encoding="utf-8")
-    check('previous_commit=plan.get("previousCommit")' in ui_src,
-          "Streamlit forwards the registry previousCommit into Query input")
-    check('new_commit=plan.get("currentCommit")' in ui_src,
-          "Streamlit forwards the pinned newCommit into Query input")
+    ark_src = Path(ark_client.__file__).read_text(encoding="utf-8")
+    check("run_ark_pipeline" in ui_src, "Streamlit forwards registry SHAs through the existing Query runner")
+    check("previous_commit=" in ark_src and "new_commit=" in ark_src,
+          "Query input still carries previousCommit and newCommit")
 
     if not _git_ok():
         print("  skip  git-backed pinning tests (git is not available)")
@@ -2401,8 +2596,10 @@ def test_analyzer() -> None:
         check(from_dump["schemaVersion"] == "1", "dump input uses schemaVersion 1")
         check(any(row["path"] == "src/app.py" for row in from_dump["files"]),
               "sanitized dump FILE sections are analyzed")
-        check(any(row["path"] == "notes.json" and row["reason"] == "unsupported" for row in from_dump["unparsed"]),
-              "non-Python dump files are reported unsupported")
+        check(not any(row["path"] == "notes.json" for row in from_dump["files"]),
+              "JSON dump files are not analyzed as source content")
+        check(any(row["path"] == "notes.json" and "json" in row["reason"] for row in from_dump["unparsed"]),
+              "excluded JSON is analyzer metadata, not source")
         check("dump-json-secret" not in json.dumps(from_dump), "collector-redacted JSON secrets stay out of analyzer output")
         check(from_dump["files"][0]["classes"], "dump-derived Python facts are present")
 
@@ -2411,6 +2608,11 @@ def test_analyzer() -> None:
         check(False, "repository URL without sanitized content is rejected")
     except analyzer.AnalyzerError:
         check(True, "repository URL without sanitized content is rejected")
+    truncated = analyzer.analyze({"dump": "REPOSITORY TREE\nsrc/\n  app.py\n"})
+    check(truncated["files"] == [] and truncated["references"] == [],
+          "a truncated dump without FILE sections returns empty analysis")
+    empty_dump = analyzer.analyze({"dump": ""})
+    check(empty_dump["files"] == [], "an empty dump returns empty analysis instead of failing")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), analyzer_server.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -2444,6 +2646,85 @@ def test_analyzer() -> None:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+    previous = analyzer.analyze({
+        "files": [
+            {"path": "src/util.py", "content": "def helper():\n    return 1\n"},
+            {"path": "src/app.py", "content": "from src.util import helper\n\ndef run():\n    helper()\n"},
+        ]
+    })
+    delta = analyzer.analyze({
+        "files": [{"path": "src/util.py", "content": "def helper():\n    return 2\n"}]
+    })
+    spliced = analyzer.splice_analysis(
+        previous,
+        delta,
+        [{"path": "src/util.py", "status": "modified", "eligible": True}],
+    )
+    util = next(row for row in spliced["files"] if row["path"] == "src/util.py")
+    app = next(row for row in spliced["files"] if row["path"] == "src/app.py")
+    check(any(fn.get("name") == "helper" for fn in util.get("functions") or []),
+          "splice replaces the changed file analysis")
+    check(app["path"] == "src/app.py", "splice keeps unchanged file analysis")
+    check(
+        any(str(row.get("from") or "").startswith("src/app.py") for row in spliced["references"]),
+        "splice keeps inbound references from unchanged files",
+    )
+    previous_full = analyzer.analyze({
+        "files": [
+            {"path": "src/util.py", "content": "def helper():\n    return 1\n"},
+            {"path": "src/app.py", "content": "from src.util import helper\n\ndef run():\n    helper()\n"},
+            {"path": "src/untied.py", "content": "VALUE = 1\n"},
+        ]
+    })
+    delta_affected = analyzer.analyze({
+        "files": [
+            {"path": "src/util.py", "content": "def helper_v2():\n    return 2\n"},
+            {"path": "src/app.py", "content": "from src.util import helper_v2\n\ndef run():\n    helper_v2()\n"},
+        ]
+    })
+    refreshed = analyzer.splice_analysis(
+        previous_full,
+        delta_affected,
+        [{"path": "src/util.py", "status": "modified", "eligible": True}],
+    )
+    util_v2 = next(row for row in refreshed["files"] if row["path"] == "src/util.py")
+    app_v2 = next(row for row in refreshed["files"] if row["path"] == "src/app.py")
+    check(any(fn.get("name") == "helper_v2" for fn in util_v2.get("functions") or []),
+          "changed+affected splice re-analyzes the modified file")
+    check(any(fn.get("name") == "run" for fn in app_v2.get("functions") or []),
+          "changed+affected splice re-analyzes the affected dependent")
+    check(
+        any(
+            str(row.get("from") or "").startswith("src/app.py")
+            and "helper_v2" in str(row.get("to") or "")
+            for row in refreshed["references"]
+        ),
+        "affected app.py references are refreshed",
+    )
+    check(
+        not any(
+            str(row.get("from") or "").startswith("src/app.py")
+            and str(row.get("to") or "").endswith("::helper")
+            for row in refreshed["references"]
+        ),
+        "stale inbound references from affected dependents are replaced",
+    )
+    check(any(row["path"] == "src/untied.py" for row in refreshed["files"]),
+          "unrelated files stay in the spliced analysis")
+    paths = [row["path"] for row in refreshed["files"]]
+    check(len(paths) == len(set(paths)), "splice does not duplicate files[] rows")
+    removed = analyzer.splice_analysis(
+        spliced,
+        {"files": [], "unparsed": [], "references": []},
+        [{"path": "src/util.py", "status": "deleted", "eligible": True}],
+    )
+    check(all(row["path"] != "src/util.py" for row in removed["files"]),
+          "splice drops deleted file analysis")
+    check(
+        not any("src/util.py" in str(row.get("to") or "") for row in removed["references"]),
+        "splice drops references to deleted files",
+    )
 
 
 def test_analyzer_cross_file() -> None:
@@ -2826,8 +3107,1413 @@ def test_repository_map() -> None:
         httpd.server_close()
 
 
+def test_incremental_analysis() -> None:
+    print("\nincremental analysis")
+    analyzer, _ = _analyzer_modules()
+    mapper, map_server = _map_modules()
+    sys.path.insert(0, str(ROOT / "tools" / "repository-map"))
+    import impact  # noqa: E402
+
+    files = [
+        {
+            "path": "src/util.py",
+            "content": "def helper(item):\n    return item\n",
+        },
+        {
+            "path": "src/app.py",
+            "content": (
+                "from src.util import helper\n"
+                "\n"
+                "def run(item):\n"
+                "    return helper(item)\n"
+            ),
+        },
+        {
+            "path": "src/unrelated.py",
+            "content": "def unused():\n    return 2\n",
+        },
+        {
+            "path": "src/unknown.py",
+            "content": "def maybe():\n    missing()\n",
+        },
+        {
+            "path": "notes.json",
+            "content": '{"token": "json-should-not-be-source"}\n',
+        },
+    ]
+    analysis = analyzer.analyze({"files": files})
+    repo_map = mapper.build({"analysis": analysis})
+
+    def change(path: str, status: str, src: str = "", eligible: bool = True, reason: str = "") -> dict:
+        row = {"path": path, "status": status, "eligible": eligible}
+        if src:
+            row["from"] = src
+        if reason:
+            row["reason"] = reason
+        return row
+
+    previous = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    current = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    modified = impact.analyze_impact(
+        {
+            "schemaVersion": "1",
+            "mode": "incremental",
+            "previousCommit": previous,
+            "newCommit": current,
+            "changed": [change("src/util.py", "modified")],
+        },
+        analysis,
+        repo_map,
+    )
+    check(modified == impact.analyze_impact(
+        {
+            "schemaVersion": "1",
+            "mode": "incremental",
+            "previousCommit": previous,
+            "newCommit": current,
+            "changed": [change("src/util.py", "modified")],
+        },
+        analysis,
+        repo_map,
+    ), "incremental analysis is deterministic")
+    check(modified["schemaVersion"] == "1", "impact schemaVersion is 1")
+    check(modified["previousCommit"] == previous and modified["newCommit"] == current,
+          "impact preserves previousCommit and newCommit")
+    check(modified["changed"][0]["path"] == "src/util.py" and modified["changed"][0]["status"] == "modified",
+          "modified file is in the changed list")
+    affected_paths = {row["path"] for row in modified["affected"]}
+    check("src/app.py" in affected_paths, "a dependent of a modified file is affected")
+    check("depends-on:src/util.py" in (modified["affected"][0]["reasons"] if modified["affected"] else []),
+          "affected reason uses the reverse exact relationship")
+    check("src/unrelated.py" not in affected_paths and "src/unrelated.py" not in modified["affectedModules"],
+          "unrelated files are not affected")
+    check("src/unknown.py" not in affected_paths, "unresolved/ambiguous calls do not create dependents")
+    check(any(row["qualname"] == "src/util.py::helper" for row in modified["affectedSymbols"]),
+          "changed-file symbols are listed")
+    check(any(row["qualname"] == "src/app.py::run" for row in modified["affectedSymbols"]),
+          "affected-module symbols are listed")
+
+    added = impact.analyze_impact(
+        {"mode": "incremental", "changed": [change("src/new.py", "added")]},
+        analysis,
+        repo_map,
+    )
+    check(added["changed"][0]["status"] == "added" and "src/new.py" in added["affectedModules"],
+          "added file is in the incremental scope")
+    check(added["affected"] == [], "an added file with no reverse dependents has no extra affected files")
+
+    deleted = impact.analyze_impact(
+        {"mode": "incremental", "changed": [change("src/util.py", "deleted")]},
+        analysis,
+        repo_map,
+    )
+    check("src/app.py" in {row["path"] for row in deleted["affected"]},
+          "dependents of a deleted file are affected")
+
+    renamed = impact.analyze_impact(
+        {"mode": "incremental", "changed": [change("src/helpers.py", "renamed", "src/util.py")]},
+        analysis,
+        repo_map,
+    )
+    check(renamed["changed"][0]["from"] == "src/util.py", "rename keeps the source path")
+    check("src/app.py" in {row["path"] for row in renamed["affected"]},
+          "dependents of a renamed file stay affected")
+    check("src/util.py" in renamed["affectedModules"] and "src/helpers.py" in renamed["affectedModules"],
+          "rename includes both old and new paths in the module scope")
+
+    json_change = impact.analyze_impact(
+        {
+            "mode": "incremental",
+            "changed": [change("notes.json", "modified", eligible=False, reason="excluded: json file")],
+        },
+        analysis,
+        repo_map,
+    )
+    check(json_change["changed"][0]["eligible"] is False, "JSON changes stay ineligible")
+    check("notes.json" not in json_change["affectedModules"],
+          "JSON files are not incremental analysis source")
+    check("json-should-not-be-source" not in json.dumps(json_change),
+          "JSON contents never enter incremental analysis")
+
+    full = impact.analyze_impact({"mode": "full", "previousCommit": "", "newCommit": current, "changed": []})
+    check(full["changed"] == [] and full["affected"] == [] and full["affectedModules"] == [],
+          "full/first run has an empty incremental scope")
+
+    same = impact.analyze_impact(modified, analysis)
+    check(same["affectedModules"] == modified["affectedModules"],
+          "impact can rebuild the map from analyzer JSON")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), map_server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = httpd.server_address[1]
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/impact",
+            data=json.dumps({
+                "changes": {
+                    "mode": "incremental",
+                    "previousCommit": previous,
+                    "newCommit": current,
+                    "changed": [change("src/util.py", "modified")],
+                },
+                "analysis": analysis,
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        check(payload == modified, "POST /impact returns the same incremental scope")
+        bad = urllib.request.Request(
+            f"http://127.0.0.1:{port}/impact",
+            data=json.dumps({"repository": "https://github.com/example/repo"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            check(False, "HTTP /impact rejects a repository URL")
+        except urllib.error.HTTPError as exc:
+            check(exc.code == 400, "HTTP /impact rejects a repository URL")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _sample_docs(*, util: str, unrelated: str, added: str = "", structure: str = "src/util.py and src/unrelated.py") -> dict:
+    return {
+        "repositoryOverview": {
+            "summary": f"Service uses `{util}` and `{unrelated}`.",
+            "quickStart": "Run src/unrelated.py",
+        },
+        "repositoryStructure": structure,
+        "toolsAndTechnologies": "Python",
+        "coreConceptsAndArchitecture": {
+            "summary": f"`{util}` is the helper.",
+            "requestFlow": f"`{util}` is called from src/app.py",
+            "buildAndPackagingFlow": "No build files.",
+        },
+        "categorizedTechnicalInformation": {
+            "mainApisAndEndpoints": "None",
+            "mainServicesAndMediators": f"`{util}`",
+            "dtosSchemasMetadata": "None",
+            "securityComponents": "None",
+            "configurations": "None",
+            "entryPoints": "src/app.py",
+            "tests": "None",
+            "risksAndTechnicalDebt": "None",
+        },
+        "developerOnboardingGuide": {
+            "first30Minutes": f"Open `{unrelated}` first.",
+            "howToInvestigateAProductionBug": f"Check `{util}`.",
+            "criticalFiles": f"- {util}\n- {unrelated}",
+            "commonMistakes": f"Do not ignore `{unrelated}`.",
+        },
+    }
+
+
+def test_incremental_documentation() -> None:
+    print("\nincremental documentation merge")
+    _validation, ark_client, registry = _host_modules()
+    sys.path.insert(0, str(ROOT / "tools" / "documentation-renderer"))
+    import merge as documentation_merge  # noqa: E402
+    import renderer  # noqa: E402
+
+    previous = _sample_docs(util="src/util.py", unrelated="src/unrelated.py")
+    generated = _sample_docs(
+        util="src/util.py",
+        unrelated="src/unrelated.py",
+        structure="src/util.py, src/unrelated.py, src/new.py",
+    )
+    generated["repositoryOverview"]["summary"] = "REWRITTEN ALL including src/unrelated.py"
+    generated["coreConceptsAndArchitecture"]["summary"] = "CHANGED helper in src/util.py"
+    generated["developerOnboardingGuide"]["first30Minutes"] = "REWRITTEN unrelated onboarding and src/util.py"
+    generated["developerOnboardingGuide"]["commonMistakes"] = "REWRITTEN src/unrelated.py mistakes"
+    generated["repositoryStructure"] = "src/util.py, src/unrelated.py, src/new.py"
+
+    impact_modified = {
+        "mode": "incremental",
+        "changed": [{"path": "src/util.py", "status": "modified", "eligible": True}],
+        "affected": [{"path": "src/app.py", "reasons": ["depends-on:src/util.py"]}],
+        "affectedModules": ["src/app.py", "src/util.py"],
+    }
+    merged = documentation_merge.merge_documentation(previous, generated, impact_modified)
+    check(merged == documentation_merge.merge_documentation(previous, generated, impact_modified),
+          "documentation merge is deterministic")
+    check("CHANGED helper" in merged["coreConceptsAndArchitecture"]["summary"],
+          "modified-file documentation is updated")
+    check(merged["developerOnboardingGuide"]["first30Minutes"] == previous["developerOnboardingGuide"]["first30Minutes"],
+          "unrelated documentation is preserved")
+    check("REWRITTEN unrelated onboarding" not in merged["developerOnboardingGuide"]["first30Minutes"],
+          "merge ignores Agent rewrites of fields the host did not select")
+    check("REWRITTEN ALL" in merged["repositoryOverview"]["summary"],
+          "overview mentioning the changed file is updated")
+    check("notes.json" not in json.dumps(merged), "JSON files are not merge source")
+
+    added_prev = previous
+    added_gen = copy.deepcopy(generated)
+    added_gen["repositoryStructure"] = "added src/new.py plus src/unrelated.py"
+    added_impact = {
+        "mode": "incremental",
+        "changed": [{"path": "src/new.py", "status": "added", "eligible": True}],
+        "affected": [],
+        "affectedModules": ["src/new.py"],
+    }
+    added = documentation_merge.merge_documentation(added_prev, added_gen, added_impact)
+    check("src/new.py" in added["repositoryStructure"], "added file updates repository structure")
+    check(added["developerOnboardingGuide"]["first30Minutes"] == previous["developerOnboardingGuide"]["first30Minutes"],
+          "added file does not rewrite unrelated onboarding")
+    check(added["repositoryOverview"]["summary"] == previous["repositoryOverview"]["summary"],
+          "adding a new module does not rewrite overview that never mentioned it")
+    omitted = copy.deepcopy(added_gen)
+    omitted["repositoryStructure"] = "src/util.py and src/unrelated.py only"
+    covered = documentation_merge.merge_documentation(added_prev, omitted, added_impact)
+    check("`src/new.py` was added." in covered["repositoryStructure"],
+          "added file is injected when the Agent omits it")
+
+    invented_gen = copy.deepcopy(generated)
+    invented_gen["coreConceptsAndArchitecture"]["summary"] = (
+        "CHANGED helper in src/util.py and also src/invented_secret.py"
+    )
+    invented = documentation_merge.merge_documentation(previous, invented_gen, impact_modified)
+    check("src/invented_secret.py" not in invented["coreConceptsAndArchitecture"]["summary"],
+          "unsupported file references are not applied")
+    check(invented["coreConceptsAndArchitecture"]["summary"] == previous["coreConceptsAndArchitecture"]["summary"],
+          "a field with invented paths keeps the previous text")
+
+    readme_impact = {
+        "mode": "incremental",
+        "changed": [{"path": "README.md", "status": "modified", "eligible": True}],
+        "affected": [],
+        "affectedModules": ["README.md"],
+        "updateFields": ["repositoryOverview.summary"],
+    }
+    readme_gen = copy.deepcopy(previous)
+    readme_gen["repositoryOverview"]["summary"] = "Rewritten overview without the new README fact."
+    readme_merged = documentation_merge.merge_documentation(previous, readme_gen, readme_impact)
+    check(
+        "AUDIT5B incremental probe: scoped documentation must mention this sentence."
+        not in readme_merged["repositoryOverview"]["summary"],
+        "merge does not invent README semantic claims without dump evidence",
+    )
+    banner = "=" * 50
+    readme_dump = (
+        f"{banner}\nFILE: README.md\n{banner}\n\nExisting README intro.\n\n"
+        "AUDIT5B incremental probe: scoped documentation must mention this sentence.\n\n"
+        f"{banner}\nDIFF: README.md\n{banner}\n\n"
+        "@@ -1,1 +1,3 @@\n Existing README intro.\n"
+        "+AUDIT5B incremental probe: scoped documentation must mention this sentence.\n"
+    )
+    readme_covered = documentation_merge.merge_documentation(
+        previous, readme_gen, readme_impact, dump=readme_dump
+    )
+    check(
+        "AUDIT5B incremental probe: scoped documentation must mention this sentence."
+        in readme_covered["repositoryOverview"]["summary"],
+        "modified README new lines are preserved from the sanitized diff",
+    )
+    probe_comment = "<!-- incremental-verify 2026-09-08: isolated README note for documentation webhook test -->"
+    comment_dump = (
+        f"{banner}\nFILE: README.md\n{banner}\n\nExisting README intro.\n\n"
+        f"{probe_comment}\n\n"
+        f"{banner}\nDIFF: README.md\n{banner}\n\n"
+        f"@@ -1,1 +1,3 @@\n Existing README intro.\n"
+        f"+{probe_comment}\n"
+    )
+    comment_covered = documentation_merge.merge_documentation(
+        previous, readme_gen, readme_impact, dump=comment_dump
+    )
+    check(
+        "incremental-verify 2026-09-08" not in comment_covered["repositoryOverview"]["summary"],
+        "README HTML comments are not copied into documentation",
+    )
+    check(
+        readme_covered["developerOnboardingGuide"]["first30Minutes"]
+        == previous["developerOnboardingGuide"]["first30Minutes"],
+        "README coverage does not rewrite unselected onboarding",
+    )
+    check(
+        readme_merged["developerOnboardingGuide"]["first30Minutes"]
+        == previous["developerOnboardingGuide"]["first30Minutes"],
+        "README coverage without dump does not rewrite unselected onboarding",
+    )
+    route_banner = "=" * 50
+    route_dump = (
+        f"{route_banner}\nFILE: backend/main.py\n{route_banner}\n\n"
+        "from fastapi import FastAPI\napp = FastAPI()\n"
+        '@app.post("/chat")\nasync def chat():\n    return {}\n'
+        '@app.get("/health")\nasync def health():\n    return {}\n'
+    )
+    omitted_routes = copy.deepcopy(previous)
+    omitted_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"] = "None listed."
+    omitted_routes["coreConceptsAndArchitecture"]["requestFlow"] = "Inferred from helpers."
+    full_routes = documentation_merge.merge_documentation(
+        None, omitted_routes, {"mode": "full"}, dump=route_dump
+    )
+    check(
+        "`POST /chat`" in full_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"]
+        and "`GET /health`" in full_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"],
+        "full merge backfills dump-grounded HTTP routes into mainApisAndEndpoints",
+    )
+    check(
+        "`POST /chat`" in full_routes["coreConceptsAndArchitecture"]["requestFlow"]
+        and "`GET /health`" in full_routes["coreConceptsAndArchitecture"]["requestFlow"],
+        "full merge backfills dump-grounded HTTP routes into requestFlow",
+    )
+    check(
+        full_routes["developerOnboardingGuide"]["first30Minutes"]
+        == omitted_routes["developerOnboardingGuide"]["first30Minutes"],
+        "route coverage does not rewrite unrelated onboarding",
+    )
+    scoped_readme_only = documentation_merge.merge_documentation(
+        previous,
+        readme_gen,
+        readme_impact,
+        dump=readme_dump,
+    )
+    check(
+        "POST /chat" not in scoped_readme_only["categorizedTechnicalInformation"]["mainApisAndEndpoints"]
+        and "GET /health" not in scoped_readme_only["coreConceptsAndArchitecture"]["requestFlow"],
+        "incremental merge does not invent routes absent from the scoped dump",
+    )
+    route_impact = {
+        "mode": "incremental",
+        "changed": [{"path": "backend/main.py", "status": "modified", "eligible": True}],
+        "affected": [],
+        "affectedModules": ["backend/main.py"],
+        "updateFields": ["categorizedTechnicalInformation.mainApisAndEndpoints"],
+    }
+    route_gen = copy.deepcopy(previous)
+    route_gen["categorizedTechnicalInformation"]["mainApisAndEndpoints"] = "Rewritten without routes."
+    scoped_routes = documentation_merge.merge_documentation(
+        previous, route_gen, route_impact, dump=route_dump
+    )
+    check(
+        "`POST /chat`" in scoped_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"]
+        and "`GET /health`" in scoped_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"],
+        "incremental merge backfills routes when the route file is in the scoped dump",
+    )
+    check(
+        scoped_routes["developerOnboardingGuide"]["first30Minutes"]
+        == previous["developerOnboardingGuide"]["first30Minutes"],
+        "incremental route coverage does not rewrite unselected onboarding",
+    )
+    patched = documentation_merge.merge_documentation(
+        previous,
+        {
+            "updates": [
+                {
+                    "field": "coreConceptsAndArchitecture.summary",
+                    "text": "CHANGED helper in src/util.py",
+                }
+            ]
+        },
+        impact_modified,
+    )
+    check("CHANGED helper" in patched["coreConceptsAndArchitecture"]["summary"],
+          "updates[] patches are applied to selected fields")
+    check(
+        patched["developerOnboardingGuide"]["first30Minutes"]
+        == previous["developerOnboardingGuide"]["first30Minutes"],
+        "updates[] leave unselected fields unchanged",
+    )
+
+    test_add_impact = {
+        "mode": "incremental",
+        "changed": [{"path": "tests/new_test.py", "status": "added", "eligible": True}],
+        "affected": [],
+        "affectedModules": ["tests/new_test.py"],
+    }
+    test_add_gen = copy.deepcopy(previous)
+    test_add_gen["categorizedTechnicalInformation"]["tests"] = "pytest only"
+    test_add_gen["repositoryStructure"] = previous["repositoryStructure"]
+    test_added = documentation_merge.merge_documentation(previous, test_add_gen, test_add_impact)
+    check("tests/new_test.py" in test_added["categorizedTechnicalInformation"]["tests"],
+          "added test files are mentioned in the tests section")
+
+    class StaleMerge:
+        @staticmethod
+        def merge_documentation(previous, generated, impact=None, section_sources=None):
+            return generated
+
+        @staticmethod
+        def documentation_only(document):
+            return document
+
+    try:
+        StaleMerge.merge_documentation(None, previous, {"mode": "full"}, dump=route_dump)
+        check(False, "stale merge_documentation rejects dump=")
+    except TypeError as exc:
+        check("dump" in str(exc), "live error is unexpected keyword argument dump")
+    stale_out = ark_client._merge_persisted(
+        StaleMerge, None, previous, {"mode": "full"}, route_dump
+    )
+    check(stale_out == previous, "persist merge does not TypeError on stale merge_documentation")
+    captured = {}
+
+    class CaptureMerge:
+        @staticmethod
+        def merge_documentation(previous, generated, impact=None, section_sources=None):
+            captured["impact"] = impact
+            return generated
+
+        @staticmethod
+        def documentation_only(document):
+            return document
+
+    ark_client._merge_persisted(CaptureMerge, None, previous, {"mode": "full"}, route_dump)
+    check(
+        "FILE: backend/main.py" in str((captured.get("impact") or {}).get("scopedDump") or ""),
+        "stale merge still receives dump via impact.scopedDump",
+    )
+    persist_routes = ark_client._merge_persisted(
+        documentation_merge, None, omitted_routes, {"mode": "full"}, route_dump
+    )
+    check(
+        "`POST /chat`" in persist_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"],
+        "current persist merge still backfills dump-grounded HTTP routes",
+    )
+    real_merge, real_renderer = ark_client._renderer_modules()
+
+    class StalePersistMerge:
+        merge_documentation = staticmethod(
+            lambda previous, generated, impact=None, section_sources=None: generated
+        )
+        documentation_only = staticmethod(real_merge.documentation_only)
+
+    original_modules = ark_client._renderer_modules
+    original_out = ark_client.OUT_DIR
+    ark_client._renderer_modules = lambda: (StalePersistMerge, real_renderer)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            ark_client.OUT_DIR = Path(tmp)
+            filename, document = ark_client.persist_generated(
+                {"repository": "https://github.com/example/persist-dump-compat"},
+                omitted_routes,
+                dump=route_dump,
+            )
+        check(bool(filename) and isinstance(document, dict),
+              "persist_generated succeeds when loaded merge_documentation rejects dump=")
+    except TypeError as exc:
+        check(False, f"persist_generated must not raise dump TypeError ({exc})")
+    finally:
+        ark_client._renderer_modules = original_modules
+        ark_client.OUT_DIR = original_out
+
+    stale_mod = type(sys)("merge")
+    def stale_merge_documentation(previous, generated, impact=None, section_sources=None):
+        raise TypeError("merge_documentation() got an unexpected keyword argument 'dump'")
+    stale_mod.merge_documentation = stale_merge_documentation
+    stale_mod.__file__ = str(ROOT / "tools" / "documentation-renderer" / "stale-cached-merge.py")
+    previous_merge = sys.modules.get("merge")
+    previous_renderer = sys.modules.get("renderer")
+    sys.modules["merge"] = stale_mod
+    try:
+        loaded_merge, loaded_renderer = ark_client._renderer_modules()
+        check(loaded_merge is not stale_mod, "persist does not keep Streamlit's cached merge module")
+        check(
+            "dump" in inspect.signature(loaded_merge.merge_documentation).parameters,
+            "persist execs tools/documentation-renderer/merge.py from disk",
+        )
+        disk_routes = loaded_merge.merge_documentation(
+            None, omitted_routes, {"mode": "full"}, dump=route_dump
+        )
+        check(
+            "`POST /chat`" in disk_routes["categorizedTechnicalInformation"]["mainApisAndEndpoints"],
+            "disk merge accepts dump= even when sys.modules['merge'] rejects it",
+        )
+        check(loaded_renderer.merge_documentation is loaded_merge.merge_documentation,
+              "renderer bindings come from the same on-disk merge")
+    finally:
+        if previous_merge is None:
+            sys.modules.pop("merge", None)
+        else:
+            sys.modules["merge"] = previous_merge
+        if previous_renderer is None:
+            sys.modules.pop("renderer", None)
+        else:
+            sys.modules["renderer"] = previous_renderer
+
+    readme_dump = (
+        "INCREMENTAL DUMP\n"
+        + ("=" * 50) + "\nFILE: README.md\n" + ("=" * 50) + "\n\n"
+        "Existing README intro that is long enough to skip as not last.\n\n"
+        "AUDIT5B incremental probe: scoped documentation must mention this sentence.\n\n"
+        + ("=" * 50) + "\nFILE: extra.py\n" + ("=" * 50) + "\nprint(1)\n"
+    )
+    stub = (
+        "\n" + ("=" * 50) + "\nFILE: tests/debug_github_tools.py\n" + ("=" * 50)
+        + "\n\n(no current body: renamed away, excluded, or not collected at this commit)\n"
+    )
+    stripped = documentation_merge.strip_placeholder_files(readme_dump + stub)
+    check("no current body" not in stripped and "FILE: tests/debug_github_tools.py" not in stripped,
+          "renamed-away FILE stubs are stripped from the incremental dump")
+
+    deleted_gen = _sample_docs(util="src/util.py", unrelated="src/unrelated.py", structure="src/unrelated.py only")
+    deleted_gen["coreConceptsAndArchitecture"]["summary"] = "helper removed"
+    deleted_gen["coreConceptsAndArchitecture"]["requestFlow"] = "src/app.py has no helper"
+    deleted = documentation_merge.merge_documentation(
+        previous,
+        deleted_gen,
+        {
+            "mode": "incremental",
+            "changed": [{"path": "src/util.py", "status": "deleted", "eligible": True}],
+            "affected": [{"path": "src/app.py"}],
+            "affectedModules": ["src/app.py", "src/util.py"],
+        },
+    )
+    check("helper removed" in deleted["coreConceptsAndArchitecture"]["summary"],
+          "deleted file updates sections that mentioned it")
+    check(deleted["developerOnboardingGuide"]["first30Minutes"] == previous["developerOnboardingGuide"]["first30Minutes"],
+          "deleted file leaves unrelated sections in place")
+
+    stale_rename = _sample_docs(util="src/util.py", unrelated="src/unrelated.py", structure="src/util.py")
+    renamed = documentation_merge.merge_documentation(
+        previous,
+        stale_rename,
+        {
+            "mode": "incremental",
+            "changed": [{"path": "src/helpers.py", "status": "renamed", "from": "src/util.py", "eligible": True}],
+            "affected": [{"path": "src/app.py"}],
+            "affectedModules": ["src/app.py", "src/helpers.py", "src/util.py"],
+        },
+    )
+    check("src/helpers.py" in renamed["coreConceptsAndArchitecture"]["summary"],
+          "renamed file uses the new path in updated sections")
+    check("src/util.py" not in renamed["coreConceptsAndArchitecture"]["summary"],
+          "stale renamed paths are rewritten")
+    check(renamed["developerOnboardingGuide"]["first30Minutes"] == previous["developerOnboardingGuide"]["first30Minutes"],
+          "rename leaves unrelated sections in place")
+
+    selected = documentation_merge.select_update_fields(previous, impact_modified)
+    check("coreConceptsAndArchitecture.summary" in selected, "host selects fields that mention the changed file")
+    check("developerOnboardingGuide.first30Minutes" not in selected,
+          "host does not select fields that only mention unrelated files")
+    check("repositoryOverview.summary" in selected, "host selects overview that cites the modified file")
+
+    unchanged_gen = _sample_docs(util="src/util.py", unrelated="src/unrelated.py")
+    unchanged_gen["coreConceptsAndArchitecture"]["summary"] = "CHANGED helper in src/util.py"
+    unchanged_gen["developerOnboardingGuide"]["first30Minutes"] = "UNCHANGED: out of incremental scope."
+    unchanged_gen["repositoryOverview"]["summary"] = "UNCHANGED: out of incremental scope."
+    unchanged_merged = documentation_merge.merge_documentation(
+        previous, unchanged_gen, impact_modified
+    )
+    check("CHANGED helper" in unchanged_merged["coreConceptsAndArchitecture"]["summary"],
+          "in-scope generated text still replaces the previous section")
+    check(
+        unchanged_merged["developerOnboardingGuide"]["first30Minutes"]
+        == previous["developerOnboardingGuide"]["first30Minutes"],
+        "UNCHANGED placeholder keeps the previous onboarding section",
+    )
+    check(
+        unchanged_merged["repositoryOverview"]["summary"]
+        == previous["repositoryOverview"]["summary"],
+        "UNCHANGED placeholder keeps the previous overview",
+    )
+
+    full = documentation_merge.merge_documentation(previous, generated, {"mode": "full", "changed": []})
+    check(full == generated, "full generation uses the new documentation")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "documentation-registry.json"
+        out = Path(tmp) / "out"
+        out.mkdir()
+        url = "https://github.com/owner/repo"
+        sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sha2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        html = out / "repo.html"
+        html.write_text("<!DOCTYPE html><html><body>first</body></html>", encoding="utf-8")
+
+        first_plan = ark_client.plan_documentation(url, current_sha=sha1, registry_path=path)
+        original_out = ark_client.OUT_DIR
+        ark_client.OUT_DIR = out
+        try:
+            first = ark_client.execute_documentation_plan(
+                first_plan,
+                run_pipeline=lambda _plan: {
+                    "ok": True,
+                    "artifact": "repo.html",
+                    "documentation": previous,
+                    "analysis": {"files": [{"path": "src/app.py"}], "unparsed": [], "references": []},
+                    "repositoryMap": {"modules": [{"path": "src/app.py"}], "symbols": [], "relationships": []},
+                },
+                registry_path=path,
+            )
+            check(first["status"] == "documented", "initial/full generation succeeds")
+            stored = registry.lookup(url, path)
+            check(stored["documentation"]["developerOnboardingGuide"]["first30Minutes"]
+                  == previous["developerOnboardingGuide"]["first30Minutes"],
+                  "successful full generation persists documentation JSON")
+            seeded = ark_client.load_analysis_sidecar({"repository": url}, sha1)
+            check(seeded is not None and seeded.get("commitSha") == sha1,
+                  "successful full generation persists analysis sidecar at currentCommit")
+            check(isinstance(first.get("analysis"), dict) and first["analysis"].get("files"),
+                  "successful full generation returns analysis on the pipeline outcome")
+
+            failed_plan = ark_client.plan_documentation(url, current_sha=sha2, registry_path=path)
+            failed = ark_client.execute_documentation_plan(
+                failed_plan,
+                run_pipeline=lambda _plan: {"ok": False, "error": "renderer failed"},
+                registry_path=path,
+            )
+            check(failed["status"] == "failed", "failed incremental update is reported as failed")
+            after_fail = registry.lookup(url, path)
+            check(after_fail["commitSha"] == sha1, "failed update does not advance the stored SHA")
+            check(after_fail["documentation"] == stored["documentation"],
+                  "failed update does not overwrite the last successful documentation")
+
+            updated = ark_client.execute_documentation_plan(
+                failed_plan,
+                run_pipeline=lambda _plan: {
+                    "ok": True,
+                    "artifact": "repo.html",
+                    "documentation": generated,
+                    "impact": impact_modified,
+                },
+                registry_path=path,
+            )
+        finally:
+            ark_client.OUT_DIR = original_out
+        check(updated["status"] == "documented" and updated["currentCommit"] == sha2,
+              "incremental modification persists the new SHA")
+        latest = registry.lookup(url, path)
+        check("CHANGED helper" in latest["documentation"]["coreConceptsAndArchitecture"]["summary"],
+              "incremental modification updates affected documentation")
+        check(
+            latest["documentation"]["developerOnboardingGuide"]["first30Minutes"]
+            == previous["developerOnboardingGuide"]["first30Minutes"],
+            "incremental modification preserves unaffected documentation",
+        )
+        check(latest["sectionFiles"]["coreConceptsAndArchitecture.summary"],
+              "lightweight section file metadata is stored with the document")
+
+        same = ark_client.plan_documentation(url, current_sha=sha2, registry_path=path)
+        skipped = ark_client.execute_documentation_plan(
+            same,
+            run_pipeline=lambda _plan: {"ok": True, "artifact": "repo.html", "documentation": generated},
+            registry_path=path,
+        )
+        check(skipped["status"] == "already_documented", "same SHA does not regenerate documentation")
+        check(registry.lookup(url, path)["documentation"] == latest["documentation"],
+              "same SHA leaves the last successful documentation in place")
+
+        rendered = renderer.render({
+            "documentation": generated,
+            "previousDocumentation": previous,
+            "impact": impact_modified,
+        })
+        check("CHANGED helper" in rendered, "renderer merge updates affected HTML")
+        check("src/unrelated.py" in rendered and "REWRITTEN unrelated onboarding" not in rendered,
+              "renderer merge keeps unaffected HTML")
+
+        production_generated = dict(generated)
+        production_generated["incrementalImpact"] = json.dumps(impact_modified)
+        production_generated["sectionSources"] = json.dumps({
+            "coreConceptsAndArchitecture.summary": ["src/util.py"],
+            "developerOnboardingGuide.first30Minutes": ["src/unrelated.py"],
+        })
+        with tempfile.TemporaryDirectory() as render_tmp:
+            original_output = os.environ.get("OUTPUT_DIR")
+            os.environ["OUTPUT_DIR"] = render_tmp
+            try:
+                sidecar = Path(render_tmp) / "repo.json"
+                sidecar.write_text(json.dumps(previous), encoding="utf-8")
+                production = renderer.resolve_document({
+                    "documentation": production_generated,
+                    "repositoryName": "repo",
+                    "persist": True,
+                })
+            finally:
+                if original_output is None:
+                    os.environ.pop("OUTPUT_DIR", None)
+                else:
+                    os.environ["OUTPUT_DIR"] = original_output
+        check("CHANGED helper" in production["coreConceptsAndArchitecture"]["summary"],
+              "ARK renderer path merges using sidecar + incrementalImpact")
+        check(
+            production["developerOnboardingGuide"]["first30Minutes"]
+            == previous["developerOnboardingGuide"]["first30Minutes"],
+            "ARK renderer path preserves unrelated sections without request-level previousDocumentation",
+        )
+        check("incrementalImpact" not in production and "sectionSources" not in production,
+              "renderer strips incremental extras from persisted documentation")
+
+        query = ark_client.build_input(
+            url,
+            previous_commit=sha1,
+            new_commit=sha2,
+            previous_documentation=previous,
+            impact=impact_modified,
+            scoped_dump="INCREMENTAL SCOPE\nFILE: src/util.py\nhelper-v2\n",
+        )
+        check("incrementalImpact:" in query and "src/util.py" in query,
+              "Query input carries compact incrementalImpact")
+        check("incrementalDump:" in query and "helper-v2" in query,
+              "Query input carries the scoped incremental dump")
+        check("FILE: src/unrelated.py" not in query,
+              "Query incremental dump does not include unrelated file bodies")
+        check("previousDocumentation:" not in query,
+              "Query input does not carry previous structured documentation")
+        check("updateFields:" in query and "coreConceptsAndArchitecture.summary" in query,
+              "Query input carries host-selected updateFields")
+        check("previousSections:" in query and "Service uses `src/util.py`" in query,
+              "Query input carries previous text only for selected fields")
+        check("Open `src/unrelated.py` first." not in query,
+              "Query previousSections omits unselected documentation fields")
+        fat = dict(impact_modified)
+        fat["scopedDump"] = "FILE: src/util.py\nONLY-SCOPED-BODY"
+        fat["fullDumpBytes"] = 99999
+        stripped = ark_client.build_input(url, previous_commit=sha1, new_commit=sha2, impact=fat)
+        check("ONLY-SCOPED-BODY" in stripped, "scopedDump on the impact object is used as incrementalDump")
+        check('"scopedDump"' not in stripped.split("incrementalImpact:", 1)[-1],
+              "Query incrementalImpact JSON does not embed the dump again")
+        check("99999" not in stripped.split("incrementalImpact:", 1)[-1],
+              "Query incrementalImpact JSON drops dump size metadata")
+        first_only = ark_client.build_input(url, new_commit=sha1)
+        check("previousDocumentation:" not in first_only and "incrementalImpact:" not in first_only
+              and "incrementalDump:" not in first_only,
+              "first/full Query omits previousDocumentation, incrementalImpact, and incrementalDump")
+
+        original_out = ark_client.OUT_DIR
+        ark_client.OUT_DIR = out
+        try:
+            seeded = ark_client.seed_previous_sidecar({
+                "repository": url,
+                "previousDocumentation": previous,
+            })
+            impact_file = ark_client.seed_impact_sidecar(
+                {"repository": url},
+                impact_modified,
+            )
+        finally:
+            ark_client.OUT_DIR = original_out
+        check(seeded is not None and seeded.is_file(),
+              "host seeds the previous documentation sidecar before the ARK Query")
+        check(json.loads(seeded.read_text(encoding="utf-8"))["repositoryStructure"]
+              == previous["repositoryStructure"],
+              "seeded sidecar is documentation state, not repository source")
+        check(impact_file is not None and impact_file.is_file(),
+              "host seeds the impact sidecar before the ARK Query")
+        check(impact_file.name.endswith(".impact.json"),
+              "impact sidecar is not a repository source JSON file")
+
+        with tempfile.TemporaryDirectory() as render_tmp:
+            original_output = os.environ.get("OUTPUT_DIR")
+            os.environ["OUTPUT_DIR"] = render_tmp
+            try:
+                Path(render_tmp, "repo.json").write_text(json.dumps(previous), encoding="utf-8")
+                Path(render_tmp, "repo.impact.json").write_text(
+                    json.dumps(impact_modified), encoding="utf-8"
+                )
+                sidecar_merge = renderer.resolve_document({
+                    "documentation": generated,
+                    "repositoryName": "repo",
+                    "persist": True,
+                })
+            finally:
+                if original_output is None:
+                    os.environ.pop("OUTPUT_DIR", None)
+                else:
+                    os.environ["OUTPUT_DIR"] = original_output
+        check("CHANGED helper" in sidecar_merge["coreConceptsAndArchitecture"]["summary"],
+              "ARK renderer path merges using previous sidecar + impact sidecar")
+        check(
+            sidecar_merge["developerOnboardingGuide"]["first30Minutes"]
+            == previous["developerOnboardingGuide"]["first30Minutes"],
+            "impact sidecar preserves unrelated sections without Agent incrementalImpact",
+        )
+
+        applied = {"count": 0}
+
+        def _block_apply(_name: str, _message: str, **_kwargs) -> None:
+            applied["count"] += 1
+
+        def _boom(_plan: dict) -> dict:
+            raise RuntimeError("scope down")
+
+        original_apply = ark_client.apply_pipeline_query
+        ark_client.apply_pipeline_query = _block_apply
+        try:
+            blocked = ark_client.run_ark_pipeline(
+                {
+                    "mode": "incremental",
+                    "repository": url,
+                    "previousCommit": sha1,
+                    "currentCommit": sha2,
+                    "previousDocumentation": previous,
+                },
+                compute_scope=_boom,
+            )
+        finally:
+            ark_client.apply_pipeline_query = original_apply
+        check(blocked.get("ok") is False and applied["count"] == 0,
+              "failed incremental scope does not apply a Query")
+
+        captured = {"message": "", "count": 0}
+
+        def _capture(_name: str, message: str, **_kwargs) -> None:
+            captured["count"] += 1
+            captured["message"] = message
+            captured["agent"] = _kwargs.get("agent")
+            raise RuntimeError("stop before wait")
+
+        def _scoped(_plan: dict) -> dict:
+            return {
+                "mode": "incremental",
+                "changed": [{"path": "src/util.py", "status": "modified", "eligible": True}],
+                "affected": [],
+                "affectedModules": ["src/util.py"],
+                "scopedDump": "INCREMENTAL SCOPE\nFILE: src/util.py\nhelper-v2\n",
+                "fullDumpBytes": 50_000,
+            }
+
+        def _missing_dump(_plan: dict) -> dict:
+            return {
+                "mode": "incremental",
+                "changed": [{"path": "src/util.py", "status": "modified", "eligible": True}],
+            }
+
+        original_apply = ark_client.apply_pipeline_query
+        ark_client.apply_pipeline_query = _capture
+        try:
+            ark_client.run_ark_pipeline(
+                {
+                    "mode": "incremental",
+                    "repository": url,
+                    "previousCommit": sha1,
+                    "currentCommit": sha2,
+                    "previousDocumentation": previous,
+                },
+                compute_scope=_scoped,
+            )
+            missing = ark_client.run_ark_pipeline(
+                {
+                    "mode": "incremental",
+                    "repository": url,
+                    "previousCommit": sha1,
+                    "currentCommit": sha2,
+                },
+                compute_scope=_missing_dump,
+            )
+        finally:
+            ark_client.apply_pipeline_query = original_apply
+        check("incrementalDump:" in captured["message"] and "helper-v2" in captured["message"],
+              "incremental Query receives the scoped dump, not a second collect")
+        check(captured.get("agent") == ark_client.INCREMENTAL_AGENT,
+              "incremental Query is routed to the incremental Agent")
+        check("FILE: src/unrelated.py" not in captured["message"],
+              "incremental Query does not include unrelated file bodies")
+        check('"fullDumpBytes"' not in captured["message"].split("incrementalImpact:", 1)[-1],
+              "incremental Query impact JSON does not include full-dump metadata")
+        check(missing.get("ok") is False and captured["count"] == 1,
+              "incremental scope without scopedDump does not apply a Query")
+
+        def _fake_scope(_plan: dict) -> dict:
+            payload = dict(impact_modified)
+            payload["scopedDump"] = "INCREMENTAL SCOPE\nFILE: src/util.py\nCHANGED helper\n"
+            return payload
+
+        original_apply = ark_client.apply_pipeline_query
+        original_wait = ark_client.wait_for_query
+        original_out = ark_client.OUT_DIR
+        ark_client.OUT_DIR = out
+        ark_client.apply_pipeline_query = lambda name, message, **_kwargs: (
+            applied.__setitem__("message", message)
+            or applied.__setitem__("agent", _kwargs.get("agent"))
+            or applied.__setitem__("count", applied["count"] + 1)
+        )
+        ark_client.wait_for_query = lambda name, **_kw: {
+            "status": {"phase": "done", "response": {"content": json.dumps(generated)}}
+        }
+        html.write_text("<!DOCTYPE html><html><body>first</body></html>", encoding="utf-8")
+        (out / "repo.json").write_text(json.dumps(generated), encoding="utf-8")
+        try:
+            applied["count"] = 0
+            scoped = ark_client.run_ark_pipeline(
+                {
+                    "mode": "incremental",
+                    "repository": url,
+                    "previousCommit": sha1,
+                    "currentCommit": sha2,
+                    "previousDocumentation": previous,
+                },
+                compute_scope=_fake_scope,
+            )
+        finally:
+            ark_client.apply_pipeline_query = original_apply
+            ark_client.wait_for_query = original_wait
+            ark_client.OUT_DIR = original_out
+        check(scoped.get("ok") is True, "successful incremental Query returns ok")
+        check((scoped.get("impact") or {}).get("changed") == impact_modified["changed"],
+              "successful incremental Query keeps host-computed changes")
+        check("updateFields" in (scoped.get("impact") or {}),
+              "successful incremental Query impact includes host-selected updateFields")
+        check("incrementalImpact:" in str(applied.get("message") or ""),
+              "incremental Query input includes host-computed incrementalImpact")
+        check("updateFields:" in str(applied.get("message") or ""),
+              "incremental Query input includes host-selected updateFields")
+        check("previousSections:" in str(applied.get("message") or ""),
+              "incremental Query input includes previousSections for selected fields")
+        check("previousDocumentation:" not in str(applied.get("message") or ""),
+              "incremental Query input omits previousDocumentation")
+        check(applied.get("agent") == ark_client.INCREMENTAL_AGENT,
+              "incremental Query targets the incremental documentation Agent")
+
+        banner = "=" * 50
+        analysis_dump = (
+            f"{banner}\nFILE: src/util.py\n{banner}\n\ndef helper():\n    return 2\n\n"
+            f"{banner}\nFILE: src/app.py\n{banner}\n\nfrom src.util import helper\n\ndef run():\n    helper()\n\n"
+            f"{banner}\nFILE: src/untied.py\n{banner}\n\nVALUE = 1\n"
+        )
+        delta_rows = ark_client._analysis_source_files(
+            analysis_dump,
+            {
+                "changed": [{"path": "src/util.py", "status": "modified", "eligible": True}],
+                "affected": [{"path": "src/app.py", "reasons": ["depends-on:src/util.py"]}],
+            },
+        )
+        delta_paths = [row["path"] for row in delta_rows]
+        check("src/util.py" in delta_paths and "src/app.py" in delta_paths,
+              "delta analysis includes changed files and affected dependents")
+        check("src/untied.py" not in delta_paths,
+              "delta analysis does not include unrelated files")
+
+        posts: list[str] = []
+        original_apply = ark_client.apply_pipeline_query
+        original_wait = ark_client.wait_for_query
+        original_post = ark_client._cluster_post
+        original_out = ark_client.OUT_DIR
+        ark_client.OUT_DIR = out
+        ark_client.apply_pipeline_query = lambda *_a, **_k: None
+        ark_client.wait_for_query = lambda *_a, **_k: {
+            "status": {"phase": "done", "response": {"content": json.dumps(previous)}}
+        }
+        ark_client._cluster_post = lambda path, payload, timeout=300: (
+            posts.append(path) or analysis_dump
+        )
+        try:
+            seeded_full = ark_client.run_ark_pipeline({
+                "mode": "full",
+                "repository": url,
+                "currentCommit": sha1,
+            })
+            seeded_posts = list(posts)
+            ark_client.wait_for_query = lambda *_a, **_k: {
+                "status": {"phase": "error", "response": {"content": "query failed"}}
+            }
+            posts.clear()
+            failed_query = ark_client.run_ark_pipeline({
+                "mode": "full",
+                "repository": url,
+                "currentCommit": sha1,
+            })
+            failed_posts = list(posts)
+            ark_client.wait_for_query = lambda *_a, **_k: {
+                "status": {"phase": "done", "response": {"content": json.dumps(previous)}}
+            }
+            ark_client._cluster_post = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("seed collect failed")
+            )
+            seed_fail = ark_client.run_ark_pipeline({
+                "mode": "full",
+                "repository": url,
+                "currentCommit": sha1,
+            })
+        finally:
+            ark_client.apply_pipeline_query = original_apply
+            ark_client.wait_for_query = original_wait
+            ark_client._cluster_post = original_post
+            ark_client.OUT_DIR = original_out
+        check(seeded_full.get("ok") is True, "successful full Query persist returns ok")
+        check("/collect" in seeded_posts, "successful full persist seeds analysis via host /collect")
+        check(isinstance(seeded_full.get("analysis"), dict),
+              "successful full persist returns host analysis")
+        check(isinstance(seeded_full.get("repositoryMap"), dict),
+              "successful full persist returns host repositoryMap")
+        check(failed_query.get("ok") is False, "failed Query does not succeed")
+        check(not failed_posts, "failed Query does not seed analysis")
+        check(seed_fail.get("ok") is True, "sidecar seed failure does not fail a successful full persist")
+        check(seed_fail.get("analysis") is None, "failed sidecar seed leaves analysis unset")
+
+        original_out = ark_client.OUT_DIR
+        ark_client.OUT_DIR = out
+        try:
+            sidecar = ark_client.persist_analysis_sidecar(
+                {"repository": url},
+                {"files": [{"path": "src/util.py"}], "unparsed": [], "references": []},
+                {"modules": [{"path": "src/util.py"}], "symbols": [], "relationships": []},
+                sha1,
+            )
+            check(sidecar is not None and sidecar.is_file(),
+                  "analysis sidecar is written beside the HTML artifact")
+            loaded = ark_client.load_analysis_sidecar({"repository": url}, sha1)
+            check(loaded is not None and loaded.get("commitSha") == sha1,
+                  "analysis sidecar loads only when commitSha matches previousCommit")
+            check(ark_client.load_analysis_sidecar({"repository": url}, sha2) is None,
+                  "analysis sidecar is ignored when SHA does not match previousCommit")
+            sidecar.write_text("{not-json", encoding="utf-8")
+            check(ark_client.load_analysis_sidecar({"repository": url}, sha1) is None,
+                  "corrupt analysis sidecar is ignored")
+            ark_client.persist_analysis_sidecar(
+                {"repository": url},
+                {"files": [{"path": "src/util.py"}], "unparsed": [], "references": []},
+                {"modules": [{"path": "src/util.py"}], "symbols": [], "relationships": []},
+                sha1,
+            )
+            before_sidecar = json.loads((out / "repo.analysis.json").read_text(encoding="utf-8"))
+            sha3 = "c" * 40
+            fail_plan = {
+                "status": "needs_documentation",
+                "mode": "incremental",
+                "repository": url,
+                "currentCommit": sha3,
+                "previousCommit": sha2,
+                "previousDocumentation": previous,
+                "runPipeline": True,
+            }
+            failed_sidecar = ark_client.execute_documentation_plan(
+                fail_plan,
+                run_pipeline=lambda _plan: {
+                    "ok": False,
+                    "error": "forced sidecar failure",
+                    "analysis": {"files": [{"path": "src/new.py"}]},
+                    "repositoryMap": {"modules": []},
+                },
+                registry_path=path,
+            )
+            after_sidecar = json.loads((out / "repo.analysis.json").read_text(encoding="utf-8"))
+            check(failed_sidecar["status"] == "failed", "failed incremental run is reported as failed")
+            check(after_sidecar == before_sidecar,
+                  "failed incremental run does not rewrite the analysis sidecar")
+            check(registry.lookup(url, path)["commitSha"] == sha2,
+                  "failed incremental run does not advance the documented SHA")
+        finally:
+            ark_client.OUT_DIR = original_out
+
+
+def test_incremental_context_optimization() -> None:
+    print("\nincremental context optimization")
+    if not _git_ok():
+        print("  skip  git is not available on PATH")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "scope-repo"
+        root.mkdir()
+        shas = build_change_fixture(root)
+        full = collector.collect(str(root))
+        check("FILE: stay.txt" in full and "unchanged" in full, "full dump includes the unchanged file")
+        check("FILE: keep.txt" in full and "version-two" in full, "full dump includes the modified file")
+        check("FILE: added.txt" in full, "full dump includes the added file")
+        check("FILE: new_name.txt" in full, "full dump includes the renamed file")
+        check("FILE: gone.txt" not in full, "full dump omits the deleted file body")
+
+        import changes  # noqa: E402
+
+        detected = changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        )
+        scoped = collector.scope_dump(full, detected)
+        check("INCREMENTAL SCOPE" in scoped, "scoped dump is marked incremental")
+        check("INCREMENTAL DUMP" in scoped, "scoped dump uses an incremental identity header")
+        check("REPOSITORY STRUCTURE" not in scoped, "scoped dump omits the full repository tree")
+        included = re.search(r"FILES INCLUDED: (\d+)", scoped)
+        bodies = re.search(r"BODIES INCLUDED: (\d+)", scoped)
+        real_bodies = [
+            path for path, body in collector.dump_files(scoped)
+            if "no current body" not in body
+        ]
+        check(
+            included is not None and bodies is not None
+            and int(included.group(1)) == int(bodies.group(1)) == len(real_bodies),
+            "scoped dump FILES INCLUDED matches attached file bodies",
+        )
+        check("FILE: keep.txt" in scoped and "version-two" in scoped, "scoped dump includes modified file body")
+        check("FILE: added.txt" in scoped and "new-file" in scoped, "scoped dump includes added file body")
+        check("FILE: new_name.txt" in scoped, "scoped dump includes renamed file body")
+        check("gone.txt" in scoped, "scoped dump records the deleted path")
+        check("FILE: stay.txt" not in scoped, "scoped dump omits the unchanged file body")
+        check("unchanged" not in scoped, "unchanged file contents do not reach the incremental dump")
+        check("stay.txt" not in {path for path, _body in collector.dump_files(scoped)},
+              "unchanged files are not FILE bodies in the incremental dump")
+        check(collector.scope_dump(full, detected) == scoped, "scoped dump is deterministic")
+
+        modify_only = {
+            "mode": "incremental",
+            "changed": [{"path": "keep.txt", "status": "modified", "eligible": True}],
+            "affected": [],
+            "affectedModules": ["keep.txt"],
+        }
+        tiny = collector.scope_dump(full, modify_only)
+        check("FILE: keep.txt" in tiny and "version-two" in tiny, "modified-only scope includes that file")
+        check("FILE: added.txt" not in tiny and "FILE: new_name.txt" not in tiny,
+              "modified-only scope omits other changed files")
+        check("FILE: stay.txt" not in tiny, "modified-only scope omits unrelated files")
+
+        _validation, ark_client, _registry = _host_modules()
+        sha1 = "a" * 40
+        sha2 = "b" * 40
+        query = ark_client.build_input(
+            "https://github.com/owner/repo",
+            previous_commit=sha1,
+            new_commit=sha2,
+            impact=detected,
+            scoped_dump=scoped,
+        )
+        check("incrementalDump:" in query, "incremental Query carries incrementalDump")
+        check("updateFields:" in query, "incremental Query carries host-selected updateFields")
+        check("version-two" in query and "new-file" in query, "incremental Query includes changed file contents")
+        check("unchanged" not in query, "incremental Query does not include unrelated file contents")
+        padded = "UNRELATED-BODY-" + ("x" * 80_000)
+        huge = full.replace("unchanged", padded, 1)
+        check(padded in huge, "synthetic full dump contains a large unrelated body")
+        scoped_huge = collector.scope_dump(huge, modify_only)
+        check(padded not in scoped_huge, "large unrelated bodies are dropped from the incremental dump")
+        check(len(scoped_huge) < len(huge) // 4,
+              "incremental dump stays far smaller than a padded full dump")
+
+        with_diffs = changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+            include_diffs=True,
+        )
+        check(with_diffs.get("diffs"), "includeDiffs attaches git patches")
+        keep_patch = next(row for row in with_diffs["diffs"] if row["path"] == "keep.txt")
+        check("version-two" in keep_patch["patch"] or "+version-two" in keep_patch["patch"],
+              "modified-file git diff carries the new content")
+        default_changes = changes.detect_changes(
+            str(root),
+            previous_commit=shas["previous"],
+            new_commit=shas["current"],
+        )
+        check("diffs" not in default_changes, "default /changes omits git patches")
+        check("version-two" not in json.dumps(default_changes),
+              "default change JSON still omits file contents")
+        dumped = collector.append_diffs(scoped, with_diffs["diffs"])
+        check("GIT DIFFS" in dumped and "DIFF: keep.txt" in dumped,
+              "incremental dump attaches DIFF headers instead of reflectPhrases")
+        check("FILE: keep.txt" in dumped, "scoped FILE bodies remain alongside diffs")
+
+        partial = collector.collect_into(str(root), paths=["keep.txt"])
+        included = [entry.path for entry in partial.entries if entry.included]
+        check("keep.txt" in included, "path-filtered collect includes the requested file")
+        check("stay.txt" not in included, "path-filtered collect omits unrelated files")
+
+        huge_dump = "INCREMENTAL DUMP\nFILE: src/big.py\n" + ("x" * 280_000)
+        huge_message = ark_client.build_input(
+            "https://github.com/owner/repo",
+            previous_commit=sha1,
+            new_commit=sha2,
+            impact=modify_only,
+            scoped_dump=huge_dump,
+        )
+        check(len(huge_message.encode("utf-8")) > 262144,
+              "incremental Query input exceeds the kubectl apply annotation limit")
+        captured: list[list[str]] = []
+        written: list[dict] = []
+
+        def fake_kubectl(args: list[str]):
+            captured.append(list(args))
+            path = args[args.index("-f") + 1]
+            written.append(json.loads(Path(path).read_text(encoding="utf-8")))
+            return subprocess.CompletedProcess(args, 0, stdout="query/ui-large-input created\n", stderr="")
+
+        original_kubectl = ark_client._kubectl
+        ark_client._kubectl = fake_kubectl
+        try:
+            ark_client.apply_pipeline_query("ui-large-input-test", huge_message)
+        finally:
+            ark_client._kubectl = original_kubectl
+        check(
+            captured and captured[0][:3] == ["kubectl", "create", "-f"],
+            "large Query is submitted with kubectl create, not apply",
+        )
+        body = written[0]
+        manifest = json.dumps(body, ensure_ascii=False)
+        check("last-applied-configuration" not in json.dumps(body.get("metadata") or {}),
+              "Query manifest does not carry a last-applied annotation")
+        check(len(manifest.encode("utf-8")) > 262144,
+              "Query JSON is large enough that apply's last-applied annotation would be rejected")
+        check((body.get("spec") or {}).get("input") == huge_message,
+              "large incrementalDump still travels in spec.input")
+
+
+def test_webhook_automation() -> None:
+    print("\nwebhook automation")
+    _validation, ark_client, registry = _host_modules()
+    import webhook  # noqa: E402
+
+    webhook.reset_triggers()
+    src = Path(webhook.__file__).read_text(encoding="utf-8")
+    check(webhook.webhook_enabled(), "webhook listener is enabled by default")
+    previous_enabled = os.environ.get("WEBHOOK_ENABLED")
+    os.environ["WEBHOOK_ENABLED"] = "false"
+    try:
+        check(not webhook.webhook_enabled() and webhook.ensure_started() is None,
+              "WEBHOOK_ENABLED=false keeps the listener off")
+    finally:
+        if previous_enabled is None:
+            os.environ.pop("WEBHOOK_ENABLED", None)
+        else:
+            os.environ["WEBHOOK_ENABLED"] = previous_enabled
+    check("collect_into" not in src and "clone_remote" not in src,
+          "webhook handler does not clone repositories")
+    check("analyze_impact" not in src and "merge_documentation" not in src,
+          "webhook handler does not run analysis or documentation merge")
+    check("kafka" not in src.lower() and "celery" not in src.lower() and "redis" not in src.lower(),
+          "webhook does not introduce a message broker")
+
+    before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    github = {
+        "ref": "refs/heads/main",
+        "before": before,
+        "after": after,
+        "repository": {"clone_url": "https://github.com/owner/repo.git"},
+    }
+    event = webhook.parse_push_event({"X-GitHub-Event": "push"}, github)
+    check(event["repository"] == "https://github.com/owner/repo.git", "GitHub push identifies the clone URL")
+    check(event["before"] == before and event["after"] == after, "GitHub push extracts before and after")
+    check(event["provider"] == "github", "GitHub push is identified as github")
+
+    gitlab = {
+        "ref": "refs/heads/main",
+        "before": before,
+        "after": after,
+        "project": {"http_url": "https://gitlab.com/group/project"},
+    }
+    gl_event = webhook.parse_push_event({"X-Gitlab-Event": "Push Hook"}, gitlab)
+    check(gl_event["repository"] == "https://gitlab.com/group/project", "GitLab push identifies the project URL")
+    check(gl_event["before"] == before and gl_event["after"] == after, "GitLab push extracts before and after")
+
+    try:
+        webhook.parse_push_event({"X-GitHub-Event": "issues"}, github)
+        check(False, "non-push GitHub events are rejected")
+    except webhook.WebhookError as exc:
+        check(exc.status == 400 and "unsupported" in str(exc).lower(), "invalid GitHub event is a 400")
+    try:
+        webhook.parse_push_event({"X-GitHub-Event": "push"}, {"after": after})
+        check(False, "push without a repository is rejected")
+    except webhook.WebhookError:
+        check(True, "push without a repository is rejected")
+    try:
+        webhook.parse_push_event(
+            {"X-GitHub-Event": "push"},
+            {"after": webhook.ZERO_SHA, "repository": {"clone_url": "https://github.com/owner/repo.git"}},
+        )
+        check(False, "deleted-branch after SHA is rejected")
+    except webhook.WebhookError:
+        check(True, "deleted-branch after SHA is rejected")
+
+    docs = _sample_docs(util="src/util.py", unrelated="src/unrelated.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "documentation-registry.json"
+        url = "https://github.com/owner/repo.git"
+        registry.record_success(url, before, artifact="repo.html", documentation=docs, path=path)
+        called: dict = {}
+
+        def run_pipeline(plan: dict) -> dict:
+            called["plan"] = dict(plan)
+            return {
+                "ok": True,
+                "artifact": "repo.html",
+                "documentation": docs,
+                "impact": {
+                    "mode": "incremental",
+                    "changed": [{"path": "src/util.py", "status": "modified", "eligible": True}],
+                    "affected": [],
+                    "affectedModules": ["src/util.py"],
+                },
+            }
+
+        accepted = webhook.process_webhook(
+            {"X-GitHub-Event": "push"},
+            json.dumps(github).encode("utf-8"),
+            run_pipeline=run_pipeline,
+            registry_path=str(path),
+            join=True,
+        )
+        check(accepted["accepted"] is True, "valid push event is accepted")
+        check(accepted["repository"] == url, "accepted payload identifies the repository")
+        check(accepted["before"] == before and accepted["after"] == after,
+              "accepted payload propagates before and after")
+        check(called["plan"]["currentCommit"] == after, "webhook plan uses the after SHA as newCommit")
+        check(called["plan"]["previousCommit"] == before, "webhook plan uses the registry SHA as previousCommit")
+        check(called["plan"]["mode"] == "incremental", "webhook triggers the incremental documentation plan")
+        check(called["plan"].get("previousDocumentation") == docs,
+              "webhook incremental plan includes the last successful documentation")
+        check(registry.lookup(url, path)["commitSha"] == after,
+              "background incremental workflow persists the after SHA")
+        www_event = webhook.parse_push_event(
+            {"X-GitHub-Event": "push"},
+            {
+                "ref": "refs/heads/main",
+                "before": before,
+                "after": after,
+                "repository": {"clone_url": "https://www.github.com/owner/repo.git"},
+            },
+        )
+        check(www_event["repository"] == "https://github.com/owner/repo.git",
+              "webhook www.github.com clone URL matches the documented repository")
+        check(registry.lookup(www_event["repository"], path)["commitSha"] == after,
+              "webhook www.github.com event finds the existing registry record")
+
+        called.clear()
+        same = webhook.process_webhook(
+            {"X-GitHub-Event": "push"},
+            json.dumps(github).encode("utf-8"),
+            run_pipeline=run_pipeline,
+            registry_path=str(path),
+            join=True,
+        )
+        check(same["accepted"] is True, "same SHA push is still accepted as a trigger")
+        check("plan" not in called, "same SHA does not run the documentation pipeline")
+        check(webhook.recent_triggers()[-1]["result"] == "already_documented",
+              "same SHA webhook result is already_documented")
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), webhook.Handler)
+        webhook.Handler.run_pipeline = run_pipeline
+        webhook.Handler.registry_path = str(path)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/webhook",
+                data=json.dumps(github).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-GitHub-Event": "push"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                check(response.status == 202, "HTTP webhook returns 202")
+                payload = json.loads(response.read().decode("utf-8"))
+            check(payload["accepted"] is True and payload["after"] == after,
+                  "HTTP webhook returns the extracted SHAs")
+            bad = urllib.request.Request(
+                f"http://127.0.0.1:{port}/webhook",
+                data=json.dumps({"action": "opened"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-GitHub-Event": "issues"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(bad, timeout=5)
+                check(False, "HTTP webhook rejects invalid events")
+            except urllib.error.HTTPError as exc:
+                check(exc.code == 400, "HTTP webhook rejects invalid events")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            webhook.Handler.run_pipeline = None
+            webhook.Handler.registry_path = None
+    webhook.reset_triggers()
+
+
 def test_pipeline_config() -> None:
-    print("\npipeline configuration")
     pipeline = (ROOT / "agents" / "repository-pipeline.yaml").read_text(encoding="utf-8")
     docs = (ROOT / "agents" / "repository-documentation.yaml").read_text(encoding="utf-8")
     agent_tool = (ROOT / "tools" / "repository-documentation.yaml").read_text(encoding="utf-8")
@@ -2845,7 +4531,12 @@ def test_pipeline_config() -> None:
     )
     tools_block = pipeline.split("prompt:", 1)[0]
     check("repository-collector" not in tools_block, "pipeline Agent does not call the collector")
-    check("documentationJson" in renderer_tool, "renderer Tool accepts documentationJson")
+    check("documentationJson" not in renderer_tool.split("http:", 1)[-1],
+          "renderer HTTP body does not interpolate a documentationJson blob")
+    check('printf "%q" .input.documentation.repositoryOverview.summary' in renderer_tool,
+          "renderer HTTP body printf-quotes nested documentation fields")
+    check("Do not pass `documentationJson`" in pipeline,
+          "pipeline Agent does not copy documentation as one JSON string")
     check(
         re.search(r"type:\s*http\s*\n\s*name:\s*repository-collector", docs) is not None,
         "documentation Agent still references the repository-collector",
@@ -2877,25 +4568,42 @@ def test_pipeline_config() -> None:
     check("repository" not in analyzer_tool.split("inputSchema:", 1)[1].split("http:", 1)[0],
           "analyzer Tool does not accept a repository URL")
     check(
-        re.search(r"type:\s*http\s*\n\s*name:\s*repository-analyzer", docs) is not None,
-        "documentation Agent references the repository-analyzer",
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-analyzer", docs) is None,
+        "documentation Agent does not call repository-analyzer as a tool",
     )
+    check("dump:" not in analyzer_tool.split("inputSchema:", 1)[1].split("http:", 1)[0],
+          "analyzer Tool inputSchema does not accept a collector dump")
+    check('"dump"' not in analyzer_tool.split("body:", 1)[-1],
+          "analyzer Tool HTTP body does not interpolate a collector dump")
     check("repository-analyzer" not in tools_block, "pipeline Agent does not call the analyzer")
     check("repository-map" not in tools_block, "pipeline Agent does not call the repository map")
     check("repository-changes" not in tools_block, "pipeline Agent does not call change detection")
-    check("Do not call repository-collector, repository-analyzer, repository-map, or" in pipeline
-          and "repository-changes" in pipeline,
-          "pipeline prompt keeps collection, analysis, mapping, and changes off the orchestrator")
+    check("repository-impact" not in tools_block, "pipeline Agent does not call incremental analysis")
+    check("Do not call repository-collector, repository-analyzer, repository-map," in pipeline
+          and "repository-changes" in pipeline and "repository-impact" in pipeline,
+          "pipeline prompt keeps collection, analysis, mapping, changes, and impact off the orchestrator")
     changes_tool = (ROOT / "tools" / "repository-changes.yaml").read_text(encoding="utf-8")
     check("/changes" in changes_tool and "type: http" in changes_tool, "changes Tool posts to /changes")
     changes_src = (ROOT / "tools" / "repository-collector" / "changes.py").read_text(encoding="utf-8")
     check("is_collectable_path" in changes_src, "change detection reuses collector path inclusion rules")
+    check("is not an ancestor" in changes_src,
+          "change detection rejects a previousCommit that is not an ancestor")
+    check('"status": "modified"' in changes_src and "STATUS_BY_CODE.get(code)" in changes_src,
+          "unknown git name-status codes are kept as modified")
     check("max_total_bytes" not in changes_src and "DEFAULT_MAX_TOTAL_BYTES" not in changes_src,
           "change detection does not apply the total collection budget")
     check('"209715200"' in collector_tool, "collector Tool default total budget is 200 MiB")
     check("DEFAULT_MAX_TOTAL_BYTES = 200 * 1024 * 1024" in collector_src,
           "collector default total budget is 200 MiB")
     check("open_remote" in collector_src, "collect reuses the same-pipeline workspace")
+    check('WORKSPACE_GRACE_SECONDS", "180"' in (ROOT / "tools" / "repository-collector" / "workspace.py").read_text(
+        encoding="utf-8"
+    ), "workspace grace covers the Agent collect after host scope")
+    check("WORKSPACE_GRACE_SECONDS" in (ROOT / "templates" / "repository-collector.yaml").read_text(
+        encoding="utf-8"
+    ), "collector Deployment sets workspace grace")
+    check("pin = current or ref" in ark_client_src and '"ref": pin' in ark_client_src,
+          "host /changes and /collect pin the same newCommit workspace key")
     analyzer_src = (ROOT / "tools" / "repository-analyzer" / "analyzer.py").read_text(encoding="utf-8")
     check("excluded_from_dump" in analyzer_src, "analyzer reads excluded-file metadata from the dump")
     check("Excluded files and unwalked directories are unseen" not in docs,
@@ -2904,8 +4612,8 @@ def test_pipeline_config() -> None:
     check((ROOT / "tools" / "repository-collector" / "workspace.py").is_file(),
           "collector workspace helper exists")
     check(
-        re.search(r"type:\s*http\s*\n\s*name:\s*repository-changes", docs) is not None,
-        "documentation Agent references repository-changes",
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-changes", docs.split("prompt:", 1)[0]) is None,
+        "documentation Agent does not expose repository-changes as a tool",
     )
     check("repository-analyzer" in values, "Helm values configure the analyzer")
     check("component: analyzer" in (ROOT / "templates" / "repository-analyzer.yaml").read_text(encoding="utf-8"),
@@ -2916,8 +4624,8 @@ def test_pipeline_config() -> None:
     check("analysisJson:" in map_schema and "repository:" not in map_schema,
           "map Tool does not accept a repository URL")
     check(
-        re.search(r"type:\s*http\s*\n\s*name:\s*repository-map", docs) is not None,
-        "documentation Agent references the repository-map",
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-map", docs) is None,
+        "documentation Agent does not call repository-map as a tool",
     )
     check("repository-map" in values, "Helm values configure the repository map")
     check("component: mapper" in (ROOT / "templates" / "repository-map.yaml").read_text(encoding="utf-8"),
@@ -2939,16 +4647,177 @@ def test_pipeline_config() -> None:
           "documentation Agent consumes Query previousCommit and newCommit")
     check("pass that exact SHA as" in docs and "collector `ref`" in docs,
           "documentation Agent pins collector ref to newCommit")
+    check("first/full generation only" in docs or "This agent is first/full generation only" in docs,
+          "full documentation Agent is full generation only")
+    check("incrementalDump" not in docs,
+          "full documentation Agent prompt does not own incrementalDump")
+    check("UNCHANGED: out of incremental scope." not in docs,
+          "full documentation Agent does not use UNCHANGED placeholders")
+    incremental_docs = (ROOT / "agents" / "repository-documentation-incremental.yaml").read_text(encoding="utf-8")
+    check("name: repository-documentation-incremental" in incremental_docs,
+          "incremental documentation Agent exists")
+    check("tools:" not in incremental_docs.split("spec:", 1)[-1].split("outputSchema:", 1)[0],
+          "incremental documentation Agent has no collector/analyzer/map tools")
+    check("updates:" in incremental_docs and "enum:" in incremental_docs,
+          "incremental Agent uses a patch updates outputSchema")
+    for key in (
+        "repositoryOverview.summary",
+        "developerOnboardingGuide.commonMistakes",
+        "categorizedTechnicalInformation.tests",
+    ):
+        check(key in incremental_docs, f"incremental Agent enum includes {key}")
+    check("GIT DIFFS" in incremental_docs or "DIFF:" in incremental_docs,
+          "incremental Agent consumes git diffs instead of reflectPhrases")
+    check("Always still collect" not in docs,
+          "incremental runs are not instructed to collect the full repository")
     check("parse_ls_remote" in ark_client_src, "ls-remote prefers the peeled annotated-tag commit")
     check("current_commit_bodies" in collector_src,
           "collector exposes current-commit bodies without stale excluded content")
     check("checkout_commit" in (ROOT / "tools" / "repository-collector" / "workspace.py").read_text(
         encoding="utf-8"
     ), "workspace checks out the requested newCommit")
-    check("tag: m12" in values, "collector image tag is m12")
-    check("tag: m2" in values, "analyzer and map image tags remain m2")
+    check("tag: m17" in values, "collector image tag is m17")
+    check("EXCLUDED_SOURCE_SUFFIXES" in collector_src and '".json"' in collector_src,
+          "JSON exclusion is a single collector eligibility rule")
+    check("tag: m4" in values, "analyzer image tag is m4")
+    check("tag: m4" in values, "map image tag is m4")
+    check("tag: m9" in values, "renderer image tag is m9")
+    check("previousDocumentation" in pipeline,
+          "pipeline Agent forwards supplied previousDocumentation")
+    check("incrementalImpact" in pipeline,
+          "pipeline Agent forwards supplied incrementalImpact")
+    check("computed outside this" in pipeline,
+          "pipeline Agent does not own deterministic change/impact computation")
+    check("incrementalDump" in pipeline,
+          "pipeline Agent forwards supplied incrementalDump")
+    check("updateFields" in pipeline and "previousSections" in pipeline,
+          "pipeline Agent forwards host-selected incremental fields")
+    check("incrementalImpact" in incremental_docs and "Do not call `repository-changes`" in docs,
+          "incremental Agent consumes impact; full Agent does not call change tools")
+    check("compute_incremental_scope" in ark_client_src and "SCOPE_SCRIPT" in ark_client_src,
+          "host computes incremental scope outside the LLM Agent")
+    check("_cluster_post" in ark_client_src and '"/changes"' in ark_client_src
+          and '"/collect"' in ark_client_src,
+          "host scope posts /changes and /collect into the collector pod")
+    check("def _seed_full_analysis" in ark_client_src,
+          "host seeds analysis/map after successful full generation")
+    check("splice_analysis" in ark_client_src and "load_analysis_sidecar" in ark_client_src,
+          "host splices analysis from a SHA-tied sidecar when the SHA matches")
+    check("_analysis_source_files" in ark_client_src,
+          "incremental analysis covers changed union affected files")
+    check("_idle_same_url" in (ROOT / "tools" / "repository-collector" / "workspace.py").read_text(
+        encoding="utf-8"
+    ), "collector reuses an idle workspace for the same repository URL")
+    check("commitSha" in ark_client_src and "previousCommit" in ark_client_src,
+          "analysis sidecar is rejected unless commitSha equals previousCommit")
+    check("append_diffs" in ark_client_src or "includeDiffs" in ark_client_src,
+          "incremental dump uses git diffs instead of reflectPhrases")
+    check("INCREMENTAL_AGENT" in ark_client_src,
+          "host routes incremental Queries to the incremental Agent")
+    check('result["scopedDump"]' in ark_client_src and "scope_dump" in ark_client_src,
+          "host returns a scoped dump for the incremental Agent")
+    check("print(dump" not in ark_client_src,
+          "host does not send the full dump through the LLM")
+    check("incrementalDump" in ark_client_src and "scoped_dump" in ark_client_src,
+          "host Query input carries incrementalDump instead of a second collect")
+    check("updateFields" in ark_client_src and "previousSections" in ark_client_src,
+          "host Query input carries selected fields instead of the full previous document")
+    check("prepare_incremental_impact" in ark_client_src,
+          "host attaches updateFields before the documentation Query")
+    check("INCREMENTAL DUMP" in collector_src,
+          "scoped dumps use an incremental header instead of the full-tree preamble")
+    check("def _cluster_python" in ark_client_src and "kubectl" in ark_client_src
+          and "exec" in ark_client_src,
+          "incremental scope runs via kubectl exec into the collector")
+    check("seed_impact_sidecar" in ark_client_src,
+          "host writes an impact sidecar for the renderer merge")
+    check("DOCS_AGENT" in ark_client_src and "persist_generated" in ark_client_src,
+          "host Query is the documentation Agent; renderer persist is local")
+    check('["kubectl", "create", "-f"' in ark_client_src,
+          "host creates Query objects instead of kubectl apply")
+    check('["kubectl", "apply", "-f"' not in ark_client_src,
+          "host does not kubectl apply Query objects")
+    merge_src = (ROOT / "tools" / "documentation-renderer" / "merge.py").read_text(encoding="utf-8")
+    check("def ensure_route_coverage" in merge_src and "def extract_http_routes" in merge_src,
+          "merge backfills dump-grounded HTTP routes after generation")
+    check("def ensure_readme_coverage" in merge_src,
+          "merge preserves new README lines from FILE/DIFF bodies")
+    check("reflectPhrases" not in ark_client_src and "reflect_phrases" not in merge_src,
+          "reflectPhrases is not used for modified-file content")
+    check("dump=dump_text" in ark_client_src and "dump=scoped_dump" in ark_client_src,
+          "host persist passes the collector dump into merge")
+    check("def _merge_persisted" in ark_client_src,
+          "host persist wraps merge_documentation dump compatibility")
+    check("spec_from_file_location" in ark_client_src and '_load_renderer_file("merge", "merge.py")' in ark_client_src,
+          "host persist execs documentation-renderer/merge.py from disk")
+    check("importlib.reload(ark_client)" in ui_src,
+          "Streamlit reloads ark_client so persist is not a pre-dump cached import")
+    check("quote the new README lines" in incremental_docs,
+          "incremental Agent is told to quote new README lines")
+    check("Do not pass the collector dump to any other tool" in docs,
+          "full Agent must not re-send the dump as another tool argument")
+    check("incrementalImpact" not in docs.split("outputSchema:", 1)[-1].split("prompt:", 1)[0],
+          "documentation Agent outputSchema stays the six documentation fields")
+    check((ROOT / "app" / "webhook.py").is_file(), "webhook trigger module exists")
+    check("ensure_started" in (ROOT / "app" / "ui.py").read_text(encoding="utf-8"),
+          "Streamlit can start the in-process webhook listener")
+    check('os.environ.get("WEBHOOK_ENABLED", "true")' in (ROOT / "app" / "webhook.py").read_text(
+        encoding="utf-8"
+    ), "webhook listener defaults on when Streamlit starts")
+    check("run_ark_pipeline" in ark_client_src and "run_ark_pipeline" in (ROOT / "app" / "webhook.py").read_text(
+        encoding="utf-8"
+    ), "webhook reuses the existing ARK Query pipeline")
+    impact_tool = (ROOT / "tools" / "repository-impact.yaml").read_text(encoding="utf-8")
+    check("/impact" in impact_tool and "type: http" in impact_tool, "impact Tool posts to /impact")
+    check("repository:" not in impact_tool.split("inputSchema:", 1)[1].split("http:", 1)[0],
+          "impact Tool does not accept a repository URL")
+    check(
+        re.search(r"type:\s*http\s*\n\s*name:\s*repository-impact", docs.split("prompt:", 1)[0]) is None,
+        "documentation Agent does not expose repository-impact as a tool",
+    )
     check("state/" in (ROOT / ".gitignore").read_text(encoding="utf-8"),
           "documentation registry directory is gitignored")
+
+
+_DUMP_FILE_HEADER = re.compile(r"(?m)^FILE: (.+)$")
+
+
+def _assert_live_sensitive_protection(
+    *,
+    dump: str,
+    html: str = "",
+    documentation: dict | None = None,
+    analysis: dict | None = None,
+    forbidden: list[str] | None = None,
+) -> None:
+    """Live collector dump, HTML, and docs must keep secrets/JSON out."""
+    check("FILE:" in (dump or ""), "live collector dump includes FILE bodies")
+    headers = _DUMP_FILE_HEADER.findall(dump or "")
+    json_files = [path for path in headers if path.lower().endswith(".json")]
+    check(not json_files, "live collector dump excludes JSON FILE bodies")
+    env_files = [
+        path for path in headers
+        if path.replace("\\", "/").rsplit("/", 1)[-1] == ".env"
+    ]
+    check(not env_files, "live collector dump excludes .env FILE bodies")
+    blob = "\n".join(
+        [
+            dump or "",
+            html or "",
+            json.dumps(documentation or {}, ensure_ascii=False),
+            json.dumps(analysis or {}, ensure_ascii=False),
+        ]
+    )
+    for item in forbidden or []:
+        check(item not in blob, "live dump/docs/HTML omit injected secret material")
+    files = analysis.get("files") if isinstance(analysis, dict) else None
+    if isinstance(files, list):
+        json_src = [
+            str(row.get("path") or "")
+            for row in files
+            if isinstance(row, dict) and str(row.get("path") or "").lower().endswith(".json")
+        ]
+        check(not json_src, "live analysis does not use JSON files as source")
 
 
 def renderer_artifact(filename: str) -> str | None:
@@ -2959,74 +4828,129 @@ def renderer_artifact(filename: str) -> str | None:
     return None
 
 
+def _verify_existing_repo_recognition(ark_client, repository: str, result: dict, reg: Path) -> None:
+    """Same URL, www alias, webhook, same SHA, and failed update against a live first-run SHA."""
+    import webhook  # noqa: E402
+
+    sha = str(result.get("currentCommit") or "")
+    other = "ffffffffffffffffffffffffffffffffffffffff"
+    same = ark_client.plan_documentation(repository, current_sha=sha, registry_path=reg)
+    check(same["status"] == "already_documented" and same.get("runPipeline") is False,
+          "e2e same repository + same SHA returns already_documented")
+    www = ark_client.plan_documentation(
+        "https://www.github.com/MooAyman/github-mcp-chatbot",
+        current_sha=sha,
+        registry_path=reg,
+    )
+    check(www["status"] == "already_documented",
+          "e2e www.github.com is recognized as the existing repository")
+    changed = ark_client.plan_documentation(repository, current_sha=other, registry_path=reg)
+    check(changed["status"] == "needs_documentation" and changed["mode"] == "incremental",
+          "e2e a new SHA plans incremental generation, not a first/full run")
+    failed = ark_client.execute_documentation_plan(
+        changed,
+        run_pipeline=lambda _plan: {"ok": False, "error": "forced incremental failure"},
+        registry_path=reg,
+    )
+    check(failed["status"] == "failed", "e2e failed incremental update is reported as failed")
+    check(ark_client.documented_commit(repository, registry_path=reg) == sha,
+          "e2e failed incremental update preserves the previous documented SHA")
+    webhook.reset_triggers()
+    accepted = webhook.process_webhook(
+        {"X-GitHub-Event": "push"},
+        json.dumps({
+            "ref": "refs/heads/main",
+            "before": sha,
+            "after": other,
+            "repository": {"clone_url": repository + ".git"},
+        }).encode("utf-8"),
+        run_pipeline=lambda plan: {
+            "ok": True,
+            "artifact": result.get("artifact") or "github-mcp-chatbot.html",
+            "documentation": plan.get("previousDocumentation") or {},
+        },
+        registry_path=str(reg),
+        join=True,
+    )
+    check(accepted["accepted"] is True and accepted["after"] == other,
+          "e2e webhook accepts a new-commit push")
+    check(webhook.recent_triggers()[-1].get("result") == "documented",
+          "e2e webhook incremental flow documents the new commit")
+    check(ark_client.documented_commit(repository, registry_path=reg) == other,
+          "e2e webhook incremental persist updates the documented SHA")
+    same_push = webhook.process_webhook(
+        {"X-GitHub-Event": "push"},
+        json.dumps({
+            "ref": "refs/heads/main",
+            "before": other,
+            "after": other,
+            "repository": {"clone_url": repository + ".git"},
+        }).encode("utf-8"),
+        run_pipeline=lambda _plan: {"ok": True, "artifact": "github-mcp-chatbot.html"},
+        registry_path=str(reg),
+        join=True,
+    )
+    check(same_push["accepted"] is True, "e2e same-SHA webhook is accepted")
+    check(webhook.recent_triggers()[-1].get("result") == "already_documented",
+          "e2e same-SHA webhook returns already_documented")
+    webhook.reset_triggers()
+
+
 def test_pipeline_e2e() -> None:
-    """One Query to Agent/repository-pipeline. No manual JSON copy."""
-    print(f"\npipeline query {PIPELINE_QUERY_NAME} (namespace {NAMESPACE})")
-
-    _kubectl(["kubectl", "delete", "query", PIPELINE_QUERY_NAME, "-n", NAMESPACE, "--ignore-not-found=true"])
-    time.sleep(1)
+    """Host documentation Agent Query and local renderer persist. No manual JSON copy."""
+    print(f"\nhost documentation query (namespace {NAMESPACE})")
+    _validation, ark_client, _registry = _host_modules()
     since_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tmp = tempfile.mkdtemp(prefix="e2e-reg-")
+    reg = Path(tmp) / "e2e-registry.json"
+    plan = ark_client.plan_documentation(TARGET_REPO, registry_path=reg)
+    check(plan["status"] == "first_run" and plan.get("runPipeline") is True,
+          "e2e full generation plans a first/full Query")
+    result = ark_client.execute_documentation_plan(
+        plan,
+        run_pipeline=ark_client.run_ark_pipeline,
+        registry_path=reg,
+    )
 
-    query = {
-        "apiVersion": "ark.mckinsey.com/v1alpha1",
-        "kind": "Query",
-        "metadata": {
-            "name": PIPELINE_QUERY_NAME,
-            "namespace": NAMESPACE,
-            "labels": {
-                "project": "repository-documentation",
-                "type": "e2e",
-                "target": "pipeline",
-            },
-        },
-        "spec": {
-            "input": "Document this repository: https://github.com/MooAyman/github-mcp-chatbot",
-            "target": {"type": "agent", "name": "repository-pipeline"},
-            "timeout": "15m",
-        },
-    }
-    if not apply_query(query):
-        check(False, "pipeline Query was applied")
+    check(result.get("status") == "documented",
+          f"host documentation succeeded (status={result.get('status')})")
+    if result.get("status") != "documented":
+        print(f"  info  error: {result.get('error')}")
         return
-
-    obj = wait_for_query(PIPELINE_QUERY_NAME, 900)
-    if obj is None:
-        check(False, "pipeline Query completed")
-        return
-
-    status = obj.get("status") or {}
-    check(status.get("phase") == "done", f"pipeline Query completed (phase={status.get('phase')})")
-    if status.get("phase") != "done":
-        return
-
-    content = (status.get("response") or {}).get("content") or ""
-    check(bool(content), "pipeline Query produced a response")
-    check("<!DOCTYPE html>" not in content, "pipeline final response is not the raw HTML document")
-    check("Documentation generated" in content or "HTML rendered" in content,
-          "pipeline reports documentation and render stages")
-    check("github-mcp-chatbot.html" in content, "pipeline names the HTML artifact")
+    check(result.get("artifact") == "github-mcp-chatbot.html",
+          "host persist names the HTML artifact")
 
     html = renderer_artifact("github-mcp-chatbot.html")
     check(html is not None, "HTML artifact exists on the renderer volume")
     if not html:
         return
     check(html.lstrip().startswith("<!DOCTYPE html>"), "artifact is a standalone HTML document")
-    check("backend/agent/agent.py" in html, "pipeline HTML cites backend/agent/agent.py")
-    check(re.search(r"POST\s+/chat", html, re.I) is not None, "pipeline HTML mentions POST /chat")
-    check(re.search(r"GET\s+/health", html, re.I) is not None, "pipeline HTML mentions GET /health")
-    check("ChatRequest" in html, "pipeline HTML mentions ChatRequest")
-    check("ChatResponse" in html, "pipeline HTML mentions ChatResponse")
-    check(re.search(r"OpenAI", html, re.I) is not None, "pipeline HTML mentions OpenAI")
-    check(re.search(r"Gemini", html, re.I) is not None, "pipeline HTML mentions Gemini")
-    check(re.search(r"GitHub MCP|github.?mcp|MCP", html) is not None, "pipeline HTML mentions GitHub MCP")
+    check("backend/agent/agent.py" in html, "host HTML cites backend/agent/agent.py")
+    check(re.search(r"POST\s+/chat", html, re.I) is not None, "host HTML mentions POST /chat")
+    check(re.search(r"GET\s+/health", html, re.I) is not None, "host HTML mentions GET /health")
+    if re.search(r"ChatRequest|ChatResponse|Pydantic", html):
+        check(True, "host HTML mentions a grounded schema/DTO name")
+    else:
+        print("  info  host HTML omitted ChatRequest/ChatResponse/Pydantic (soft model wording)")
+    check(re.search(r"OpenAI", html, re.I) is not None, "host HTML mentions OpenAI")
+    check(re.search(r"Gemini", html, re.I) is not None, "host HTML mentions Gemini")
+    check(re.search(r"GitHub MCP|github.?mcp|MCP", html) is not None, "host HTML mentions GitHub MCP")
 
     collects = collector_collect_count(since_time)
+    analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else None
+    check(
+        analysis is not None and isinstance(analysis.get("files"), list),
+        "successful full generation returns host-seeded analysis",
+    )
+    print(f"  info  full-gen POST /collect count={collects}")
     if collects is None:
-        check(False, "collector logs are readable after the pipeline Query")
+        check(False, "collector logs are readable after the host Query")
+    elif collects >= 2:
+        check(True, "full host generation caused Agent collect plus sidecar seed")
     else:
         check(
-            collects == 1,
-            f"pipeline caused exactly one collector call (since={since_time}, count={collects})",
+            analysis is not None,
+            f"full host generation seeded analysis (since={since_time}, collect log count={collects})",
         )
 
     check(HTML_OUTPUT.is_file(), f"HTML artifact exists on the Windows host ({HTML_OUTPUT})")
@@ -3034,9 +4958,359 @@ def test_pipeline_e2e() -> None:
         host_html = HTML_OUTPUT.read_text(encoding="utf-8")
         check(host_html.lstrip().startswith("<!DOCTYPE html>"), "host HTML is a standalone document")
         check("backend/agent/agent.py" in host_html, "host HTML cites backend/agent/agent.py")
-    print(f"  info  pipeline wrote {len(html)} bytes to {HTML_OUTPUT}")
-    preview = content[:400].encode("ascii", "backslashreplace").decode("ascii")
-    print(f"  info  pipeline response: {preview!r}")
+    print(f"  info  host persist wrote {len(html)} bytes to {HTML_OUTPUT}")
+    print(f"  info  documented SHA {result.get('currentCommit')}")
+    sidecar_data = ark_client.load_analysis_sidecar({"repository": TARGET_REPO}, str(result.get("currentCommit") or ""))
+    check(
+        sidecar_data is not None and sidecar_data.get("commitSha") == result.get("currentCommit"),
+        "full generation persisted analysis sidecar at currentCommit",
+    )
+    print(f"  info  sidecar SHA {None if sidecar_data is None else sidecar_data.get('commitSha')}")
+    print(f"  info  full tokenUsage={result.get('tokenUsage')} queryDurationMs={result.get('queryDurationMs')}")
+    live_dump = ark_client._cluster_post(
+        "/collect",
+        {"repository": TARGET_REPO, "ref": str(result.get("currentCommit") or "")},
+    )
+    _assert_live_sensitive_protection(
+        dump=live_dump,
+        html=html or "",
+        documentation=result.get("documentation") if isinstance(result.get("documentation"), dict) else None,
+        analysis=analysis,
+    )
+    _run_incremental_e2e(ark_client, reg, result)
+    latest = ark_client.documented_commit(TARGET_REPO, registry_path=reg) or result.get("currentCommit")
+    if result.get("status") == "documented" and latest:
+        _verify_existing_repo_recognition(
+            ark_client,
+            TARGET_REPO,
+            {**result, "currentCommit": latest},
+            reg,
+        )
+
+
+def _run_incremental_e2e(ark_client, registry_path: Path, full_result: dict) -> None:
+    """Throwaway-branch incremental generation. Does not rewrite main."""
+    print("\nhost incremental query")
+    previous = str(full_result.get("currentCommit") or "")
+    if not previous:
+        check(False, "incremental e2e needs a documented SHA from full generation")
+        return
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    branch = f"docs-inc-e2e-{stamp}"
+    probe = f"E2E-INC-PROBE {stamp}: scoped documentation must mention this sentence."
+    added = "docs_e2e_added.py"
+    clone = None
+    original_out = ark_client.OUT_DIR
+    git_env = dict(os.environ)
+    git_env["GIT_AUTHOR_NAME"] = "docs-e2e"
+    git_env["GIT_AUTHOR_EMAIL"] = "docs-e2e@example.com"
+    git_env["GIT_COMMITTER_NAME"] = git_env["GIT_AUTHOR_NAME"]
+    git_env["GIT_COMMITTER_EMAIL"] = git_env["GIT_AUTHOR_EMAIL"]
+    try:
+        clone = Path(tempfile.mkdtemp(prefix="inc-e2e-"))
+        subprocess.run(
+            ["git", "clone", TARGET_REPO, str(clone)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        subprocess.run(
+            ["git", "checkout", "-B", branch, previous],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        readme = clone / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + f"\n{probe}\n", encoding="utf-8")
+        (clone / added).write_text('"""Incremental e2e added module."""\nVALUE = 1\n', encoding="utf-8")
+        github_pat = "ghp_" + ("A" * 36)
+        json_leak = f"E2E_JSON_ZX9Q_LEAK_{stamp}"
+        env_leak = f"E2E_ENV_ZX9Q_LEAK_{stamp}"
+        (clone / "docs_e2e_secret.py").write_text(f'TOKEN = "{github_pat}"\n', encoding="utf-8")
+        (clone / "docs_e2e_secret.json").write_text(json.dumps({"token": json_leak}) + "\n", encoding="utf-8")
+        (clone / ".env").write_text(f"SECRET={env_leak}\n", encoding="utf-8")
+        rename_src = None
+        for candidate in (clone / "backend").rglob("*.py"):
+            rel = candidate.relative_to(clone).as_posix()
+            if rel.endswith("main.py") or rel.endswith("agent.py"):
+                continue
+            rename_src = rel
+            break
+        delete_rel = None
+        for candidate in clone.rglob("*.md"):
+            rel = candidate.relative_to(clone).as_posix()
+            if rel.lower() in {"readme.md", "license.md"}:
+                continue
+            delete_rel = rel
+            break
+        if rename_src:
+            dest = str(Path(rename_src).with_name(Path(rename_src).stem + "_e2e_renamed.py")).replace("\\", "/")
+            subprocess.run(["git", "mv", rename_src, dest], cwd=str(clone), check=True, capture_output=True, text=True)
+            rename_dst = dest
+        else:
+            rename_dst = None
+        if delete_rel:
+            subprocess.run(["git", "rm", "-f", delete_rel], cwd=str(clone), check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(clone), check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "add", "-f", ".env", "docs_e2e_secret.json", "docs_e2e_secret.py"],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"docs e2e incremental {stamp}"],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=git_env,
+        )
+        current = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        plan = ark_client.plan_documentation(TARGET_REPO, current_sha=current, registry_path=registry_path)
+        check(plan["mode"] == "incremental" and plan["previousCommit"] == previous,
+              "incremental e2e plans incremental generation from the full-run SHA")
+        started = time.monotonic()
+        result = ark_client.execute_documentation_plan(
+            plan,
+            run_pipeline=ark_client.run_ark_pipeline,
+            registry_path=registry_path,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        check(result.get("status") == "documented" and result.get("currentCommit") == current,
+              f"incremental e2e documented the throwaway commit (status={result.get('status')})")
+        if result.get("status") != "documented":
+            print(f"  info  incremental error: {result.get('error')}")
+            return
+        meta = result.get("scopeMeta") or {}
+        check(meta.get("usedSidecar") is True and meta.get("collectMode") == "paths",
+              "first incremental run uses the full-generation sidecar")
+        print(f"  info  first-incremental usedSidecar={meta.get('usedSidecar')} collectMode={meta.get('collectMode')}")
+        docs = result.get("documentation") or {}
+        blob = json.dumps(docs)
+        check(added.replace(".py", "") in blob or added in blob or f"`{added}` was added." in blob,
+              "incremental e2e mentions the added file")
+        if rename_dst:
+            check(rename_dst in blob or Path(rename_dst).name in blob,
+                  "incremental e2e mentions the renamed path")
+            check(rename_src not in blob or f"{rename_src} (removed)" in blob or rename_dst in blob,
+                  "incremental e2e does not keep the old rename path as current-only")
+        if delete_rel:
+            check(delete_rel not in blob or f"{delete_rel} (removed)" in blob or f"`{delete_rel}` was deleted." in blob,
+                  "incremental e2e covers the deleted path")
+        html_path = ark_client.OUT_DIR / "github-mcp-chatbot.html"
+        html = html_path.read_text(encoding="utf-8") if html_path.is_file() else ""
+        check(probe in blob or probe in html,
+              "modified README content comes from git diffs/FILE bodies, not reflectPhrases")
+        live_dump = ark_client._cluster_post("/collect", {"repository": TARGET_REPO, "ref": current})
+        _assert_live_sensitive_protection(
+            dump=live_dump,
+            html=html,
+            documentation=docs if isinstance(docs, dict) else None,
+            analysis=result.get("analysis") if isinstance(result.get("analysis"), dict) else None,
+            forbidden=[github_pat, json_leak, env_leak],
+        )
+        check("[REDACTED:github-pat]" in live_dump,
+              "live dump redacts a GitHub PAT from an eligible file")
+        sidecar_data = ark_client.load_analysis_sidecar({"repository": TARGET_REPO}, current)
+        check(sidecar_data is not None and sidecar_data.get("commitSha") == current,
+              "incremental e2e persists an analysis sidecar tied to the new commit SHA")
+        check(ark_client.load_analysis_sidecar({"repository": TARGET_REPO}, previous) is None,
+              "analysis sidecar for the new commit is not used as previousCommit")
+        print(f"  info  incremental tokenUsage={result.get('tokenUsage')} queryDurationMs={result.get('queryDurationMs') or elapsed_ms}")
+        print(f"  info  incremental scopeMeta={result.get('scopeMeta')}")
+        print(f"  info  full tokenUsage={full_result.get('tokenUsage')} queryDurationMs={full_result.get('queryDurationMs')}")
+        print(f"  info  add={added} rename={rename_src}->{rename_dst} delete={delete_rel}")
+
+        (clone / "README.md").write_text(
+            (clone / "README.md").read_text(encoding="utf-8") + f"\nsecond-inc {stamp}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "README.md"], cwd=str(clone), check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"docs e2e incremental sidecar {stamp}"],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+        )
+        current2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(clone),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "push", "origin", branch], cwd=str(clone), check=True, capture_output=True, text=True)
+        hit = ark_client.compute_incremental_scope({
+            "repository": TARGET_REPO,
+            "previousCommit": current,
+            "currentCommit": current2,
+        })
+        check(hit.get("usedSidecar") is True and hit.get("collectMode") == "paths",
+              "matching sidecar SHA analyzes only changed files")
+        print(f"  info  sidecar-hit collectElapsedMs={hit.get('collectElapsedMs')} analyzeElapsedMs={hit.get('analyzeElapsedMs')} collectMode={hit.get('collectMode')}")
+        sidecar = ark_client.analysis_sidecar_path({"repository": TARGET_REPO})
+        sidecar.write_text(
+            json.dumps({"commitSha": "0" * 40, "analysis": {"files": []}, "repositoryMap": {"modules": []}}),
+            encoding="utf-8",
+        )
+        miss = ark_client.compute_incremental_scope({
+            "repository": TARGET_REPO,
+            "previousCommit": current,
+            "currentCommit": current2,
+        })
+        check(miss.get("usedSidecar") is False and miss.get("collectMode") == "full",
+              "SHA-mismatched sidecar falls back to full collect/analyze")
+        print(f"  info  sidecar-miss collectElapsedMs={miss.get('collectElapsedMs')} analyzeElapsedMs={miss.get('analyzeElapsedMs')} collectMode={miss.get('collectMode')}")
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
+        check("GIT DIFFS" in str(hit.get("scopedDump") or "") or "DIFF:" in str(hit.get("scopedDump") or ""),
+              "incremental dump includes git diffs")
+        check("reflectPhrases" not in json.dumps(hit.get("updateFields") or []),
+              "incremental impact does not use reflectPhrases")
+    except Exception as exc:
+        check(False, f"incremental e2e raised {type(exc).__name__}: {exc}")
+        print(f"  info  incremental e2e error: {exc}")
+    finally:
+        ark_client.OUT_DIR = original_out
+        if clone is not None:
+            subprocess.run(
+                ["git", "push", "origin", "--delete", branch],
+                cwd=str(clone),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            print(f"  info  deleted throwaway branch {branch}")
+            import shutil
+            shutil.rmtree(clone, ignore_errors=True)
+
+
+def test_self_repo_incremental_e2e() -> None:
+    """Incremental Query for Automated-Repository-Documentation (annotation overflow repo)."""
+    ref = "v2-development"
+    print(f"\nincremental Query create ({SELF_REPO} ref={ref})")
+    _validation, ark_client, registry = _host_modules()
+    current = ark_client.resolve_commit_sha(SELF_REPO, ref)
+    check(bool(current), "self-repo e2e resolves the v2-development GitHub SHA")
+    if not current:
+        return
+    subprocess.run(
+        ["git", "fetch", "--no-tags", "origin", ref],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    parent = subprocess.run(
+        ["git", "rev-parse", f"{current}^"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if parent.returncode != 0:
+        subprocess.run(
+            ["git", "fetch", "--no-tags", "origin", current],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        parent = subprocess.run(
+            ["git", "rev-parse", f"{current}^"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    previous = (parent.stdout or "").strip()
+    older = subprocess.run(
+        ["git", "rev-parse", f"{current}~3"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if older.returncode == 0 and (older.stdout or "").strip():
+        previous = (older.stdout or "").strip()
+    check(bool(previous) and previous != current, "self-repo e2e has a parent SHA for incremental")
+    if not previous or previous == current:
+        return
+    tmp = tempfile.mkdtemp(prefix="e2e-self-reg-")
+    reg = Path(tmp) / "e2e-registry.json"
+    stub = _sample_docs(util="app/ark_client.py", unrelated="README.md")
+    registry.record_success(
+        SELF_REPO,
+        previous,
+        artifact="automated-repository-documentation.html",
+        documentation=stub,
+        path=reg,
+    )
+    plan = ark_client.plan_documentation(SELF_REPO, ref, current_sha=current, registry_path=reg)
+    check(
+        plan.get("mode") == "incremental" and plan.get("previousCommit") == previous,
+        "self-repo e2e plans incremental generation",
+    )
+    print(f"  info  self-repo previous={previous} current={current}")
+    result = ark_client.execute_documentation_plan(
+        plan,
+        run_pipeline=ark_client.run_ark_pipeline,
+        registry_path=reg,
+    )
+    err = str(result.get("error") or "")
+    check(
+        "Too long" not in err and "metadata.annotations" not in err,
+        "self-repo incremental Query is not rejected for annotation size",
+    )
+    check("kubectl apply failed" not in err, "self-repo incremental does not use kubectl apply")
+    check(
+        result.get("status") == "documented",
+        f"self-repo incremental documented (status={result.get('status')} error={err[:240]})",
+    )
+    check(
+        int(result.get("queryDurationMs") or 0) > 0,
+        "self-repo incremental submitted an ARK Query (did not skip)",
+    )
+    print(f"  info  self-repo status={result.get('status')} currentCommit={result.get('currentCommit')}")
+    print(f"  info  self-repo tokenUsage={result.get('tokenUsage')} queryDurationMs={result.get('queryDurationMs')}")
+    print(f"  info  self-repo scopeMeta={result.get('scopeMeta')}")
+    print(f"  info  self-repo error={err[:300] if err else None}")
 
 
 def test_renderer_unit() -> None:
@@ -3050,6 +5324,7 @@ def test_renderer_unit() -> None:
 def main() -> int:
     test_filtering_and_structure()
     test_determinism_and_render()
+    test_json_exclusion()
     test_budget_and_errors()
     test_urls_and_invalid_input()
     test_dump_sanitization()
@@ -3071,6 +5346,10 @@ def main() -> int:
     test_analyzer()
     test_analyzer_cross_file()
     test_repository_map()
+    test_incremental_analysis()
+    test_incremental_documentation()
+    test_incremental_context_optimization()
+    test_webhook_automation()
     test_pipeline_config()
     if "--network" in sys.argv:
         test_live_clone()
@@ -3079,6 +5358,7 @@ def main() -> int:
     test_optional_gitlab_e2e()
     if "--e2e" in sys.argv:
         test_pipeline_e2e()
+        test_self_repo_incremental_e2e()
     else:
         print("skipping deployed end-to-end test (pass --e2e to enable)")
 

@@ -1,8 +1,7 @@
 # ARK Tool: deterministic Repository Map from analyzer JSON.
 #
-# Called by Agent/repository-documentation after repository-analyzer.
-# Accepts already-sanitized analyzer output only. Does not clone, parse
-# source, or call a language model.
+# Host-side map after persist. The documentation Agent must not call this
+# Tool with a collector dump. Accepts already-sanitized analyzer JSON only.
 apiVersion: ark.mckinsey.com/v1alpha1
 kind: Tool
 metadata:
@@ -37,4 +36,4 @@ spec:
         value:
           value: application/json
     body: |
-      {"analysis": {{.input.analysisJson}}}
+      {"analysis": {{if .input.analysisJson}}{{.input.analysisJson}}{{else}}{"files":[],"unparsed":[],"references":[]}{{end}}}

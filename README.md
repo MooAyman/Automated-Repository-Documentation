@@ -21,10 +21,12 @@ Tool/repository-collector          clone, filter, deterministic text dump
 Tool/repository-analyzer           Python AST + unique cross-file references (sanitized input only)
   ↓  HTTP Tool
 Tool/repository-map                deterministic modules/symbols/relationships (analyzer JSON only)
+  ↓  HTTP Tool (incremental only)
+Tool/repository-impact             changed files + one-hop dependents (map/analyzer only)
   ↓
 Structured JSON
   ↓  HTTP Tool
-Tool/documentation-renderer        deterministic HTML (no LLM)
+Tool/documentation-renderer        merge previous sidecar + impact, then HTML
   ↓  /mnt/output/<repo>.html
 Windows host
   C:\Users\moham\source\repos\repository-documentation\out\<repo>.html
@@ -32,13 +34,14 @@ Windows host
 
 | Resource                   | Kind          | Responsibility                                                                                                                            |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `repository-pipeline`      | Agent         | Extract URL and optional `ref`, call the documentation Agent once, pass the JSON unchanged to the renderer, return the artifact filename. |
-| `repository-documentation` | Agent         | Call collector, analyzer, then map; analyse the dump (source of truth) plus that deterministic evidence; fill `spec.outputSchema`.         |
+| `repository-pipeline`      | Agent         | Extract URL, optional `ref`, and supplied SHAs/previous docs; call the documentation Agent once; pass the JSON unchanged to the renderer. |
+| `repository-documentation` | Agent         | Call collector, analyzer, map, and (when `previousCommit` is supplied) changes + impact; fill `spec.outputSchema`.                         |
 | `repository-collector`     | Tool (`http`) | Clone a Git URL, filter secrets/binaries/caches, emit a deterministic text dump. Same-pipeline `/changes`+`/collect` reuse one workspace. |
 | `repository-analyzer`      | Tool (`http`) | Conservative Python AST on already-sanitized files/dump. Resolves unique same-file and imported cross-file references. Does not clone.    |
 | `repository-map`           | Tool (`http`) | Deterministic Repository Map from analyzer JSON: modules, symbols, relationships, tree. No clone, no AST, no LLM.                         |
 | `repository-changes`       | Tool (`http`) | Deterministic file changes between two commit SHAs (same collector service and inclusion rules). Empty previous SHA is a first/full run. |
-| `documentation-renderer`   | Tool (`http`) | Validate the JSON and render standalone HTML.                                                                                             |
+| `repository-impact`        | Tool (`http`) | Deterministic incremental scope from `/changes` plus analyzer/map relationships. No clone, no LLM.                                      |
+| `documentation-renderer`   | Tool (`http`) | Validate JSON, merge with the last sidecar when impact is present, render standalone HTML.                                                |
 | Streamlit UI (`app/`)      | host client   | Validates URL/ref, consults the last-documented SHA registry, applies one Query when needed, then opens or downloads `out/<repo>.html`. |
 | ARK / Kubernetes           | runtime       | Agents, Tools, `Model/default`, collector/analyzer/map Deployments/Services, and the renderer Service (host-backed when `hostDocker` is true). |
 
@@ -96,10 +99,10 @@ kubectl get model default
 Build images (Docker Desktop uses the local image store; no `docker push` is required). Tags match `values.yaml`:
 
 ```powershell
-docker build -t localhost:5000/repository-documentation-repository-collector:m12 tools/repository-collector
-docker build -t localhost:5000/repository-documentation-repository-analyzer:m2 tools/repository-analyzer
-docker build -t localhost:5000/repository-documentation-repository-map:m2 tools/repository-map
-docker build -t localhost:5000/repository-documentation-documentation-renderer:m5 tools/documentation-renderer
+docker build -t localhost:5000/repository-documentation-repository-collector:m13 tools/repository-collector
+docker build -t localhost:5000/repository-documentation-repository-analyzer:m4 tools/repository-analyzer
+docker build -t localhost:5000/repository-documentation-repository-map:m4 tools/repository-map
+docker build -t localhost:5000/repository-documentation-documentation-renderer:m7 tools/documentation-renderer
 ```
 
 Publish the renderer on the Windows host so `/mnt/output` is the repo `out/` directory (Docker Desktop Kubernetes cannot `hostPath` a Windows folder):
@@ -110,7 +113,7 @@ New-Item -ItemType Directory -Force -Path .\out | Out-Null
 docker run -d --name documentation-renderer-host --restart=unless-stopped `
   -p 18080:8080 -e OUTPUT_DIR=/mnt/output `
   -v C:\Users\moham\source\repos\repository-documentation\out:/mnt/output `
-  localhost:5000/repository-documentation-documentation-renderer:m5
+  localhost:5000/repository-documentation-documentation-renderer:m7
 ```
 
 The bind mount must be this checkout's `out/` directory and must match `values.yaml` `renderer.output.windowsPath`.
@@ -125,10 +128,10 @@ Verify:
 
 ```powershell
 kubectl get agent repository-pipeline repository-documentation
-kubectl get tool repository-documentation repository-collector repository-analyzer repository-map repository-changes documentation-renderer
+kubectl get tool repository-documentation repository-collector repository-analyzer repository-map repository-changes repository-impact documentation-renderer
 ```
 
-Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-analyzer` (http), `repository-map` (http), `repository-changes` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
+Expected: both Agents `Available`; Tools `repository-collector` (http), `repository-analyzer` (http), `repository-map` (http), `repository-changes` (http), `repository-impact` (http), `repository-documentation` (agent), and `documentation-renderer` (http) Ready.
 
 With `renderer.output.hostDocker: true` (this chart's default), there is no in-cluster renderer Deployment. Confirm the host container instead:
 
@@ -192,6 +195,8 @@ python -m streamlit run app\ui.py
 ```
 
 Open [http://localhost:8501](http://localhost:8501). Enter a repository URL and an optional ref, then **Generate Documentation**. Invalid input is rejected before a Query is applied. The app applies one Query to `agent/repository-pipeline` (timeout 15m), waits for `done`, and reads the HTML from `out/`. **Open Preview** opens that file in a new browser tab. **Download HTML** saves it.
+
+The UI starts an in-process GitHub/GitLab push listener (`http://127.0.0.1:8787/webhook`) unless `WEBHOOK_ENABLED=0`. GitHub.com cannot deliver to localhost unless you expose that port.
 
 The UI does not change Agents, Tools, prompts, or schemas.
 
@@ -378,6 +383,7 @@ out/                            Generated HTML (host bind; not a pipeline input)
 - Local filesystem collection exists inside the collector container only. It is not a supported user-facing pipeline input.
 - The Streamlit UI requires a working `kubectl` context and a deployed chart; it is not an in-cluster service.
 - The last-documented SHA registry is host-side (`state/documentation-registry.json`). `ark query` from the CLI still always runs the full pipeline.
+- Streamlit starts an in-process push webhook on port 8787. GitHub/GitLab on the internet cannot reach `127.0.0.1`; register a reachable URL (tunnel or public host) on the repository. Set `WEBHOOK_ENABLED=0` to disable the listener.
 
 ## Future work
 
@@ -390,7 +396,7 @@ Not implemented as user-facing features:
 ### Repository Coverage
 
 - Intelligent File Selection & Prioritization
-- Incremental documentation generation (change detection exists; affected-file analysis and doc merging do not)
+- Incremental documentation generation (change detection, affected-file analysis, merge, and push webhooks are implemented)
 - Local repository support (host-path / workstation repositories as pipeline input)
 - Private GitHub repository support
 
